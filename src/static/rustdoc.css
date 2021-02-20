@@ -1000,10 +1000,10 @@ h3 > .collapse-toggle, h4 > .collapse-toggle {
 	margin-top: 1px !important;
 }
 
-#main > .sub-variant > h3 {
+.sub-variant > h3 {
 	font-size: 15px;
-	margin-left: 25px;
-	margin-bottom: 5px;
+	margin-left: 25px !important;
+	margin-bottom: 5px !important;
 }
 
 .sub-variant > div {

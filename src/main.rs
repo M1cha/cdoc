@@ -46,7 +46,11 @@ fn process_file(
 
     std::env::set_current_dir(&command.directory)?;
     let compilationunit = std::fs::canonicalize(&command.file)?;
-    let outpath = std::path::Path::new("/tmp/cdoc.c");
+    //let outpath = std::path::Path::new("/tmp/cdoc.c");
+    let outpath = std::path::PathBuf::from(format!(
+        "/tmp/cdoc-{}.c",
+        compilationunit.file_name().unwrap().to_str().unwrap()
+    ));
 
     // TODO: use argument parser which supports quoting
     let mut args: Vec<_> = command.command.split_whitespace().collect();
@@ -77,7 +81,11 @@ fn process_file(
     }
 
     let index = clang::Index::new(&clang, false, true);
-    let tu = index.parser(outpath).parse().unwrap();
+    let tu = index
+        .parser(outpath)
+        .arguments(&["-target", "armv7a"])
+        .parse()
+        .unwrap();
     for entity in tu.get_entity().get_children() {
         let loc = if let Some(loc) = entity.get_location().map(|loc| loc.get_presumed_location()) {
             loc
@@ -91,58 +99,33 @@ fn process_file(
         }
 
         let file = files.for_path(&abspath);
+        /*println!(
+            "{:#?}",
+            entity
+                .get_children()
+                .iter()
+                .map(|c| c.get_type())
+                .collect::<Vec<_>>()
+        );*/
         let kind = match entity.get_kind() {
-            clang::EntityKind::EnumDecl => parsed::EnumKind(parsed::Enum {
-                variants: entity
-                    .get_children()
-                    .iter()
-                    .filter(|entity| entity.get_kind() == clang::EntityKind::EnumConstantDecl)
-                    .map(|entity| parsed::EnumVariant {
-                        name: entity.get_display_name().unwrap(),
-                    })
-                    .collect(),
-            }),
-            clang::EntityKind::FunctionDecl => parsed::FunctionKind(parsed::Function {
-                ty: entity.get_type().unwrap().get_display_name(),
-            }),
-            clang::EntityKind::StructDecl => parsed::StructKind(parsed::Struct {
-                fields: entity
-                    .get_children()
-                    .iter()
-                    .filter(|entity| entity.get_kind() == clang::EntityKind::FieldDecl)
-                    .map(|entity| parsed::StructField {
-                        name: entity.get_display_name().unwrap(),
-                        ty: entity.get_type().unwrap().get_display_name(),
-                    })
-                    .collect(),
-            }),
-            clang::EntityKind::TypedefDecl => parsed::TypedefKind(parsed::Typedef {
-                ty: entity
-                    .get_typedef_underlying_type()
-                    .unwrap()
-                    .get_display_name(),
-            }),
-            clang::EntityKind::UnionDecl => parsed::UnionKind(parsed::Union {}),
-            clang::EntityKind::VarDecl => parsed::VariableKind(parsed::Variable {
-                ty: entity.get_type().unwrap().get_display_name(),
-            }),
+            clang::EntityKind::EnumDecl => parsed::EnumKind(parsed::Enum::from(&entity)),
+            clang::EntityKind::FunctionDecl => {
+                parsed::FunctionKind(parsed::Function::from(&entity))
+            }
+            clang::EntityKind::StructDecl => parsed::StructKind(parsed::Struct::from(&entity)),
+            clang::EntityKind::TypedefDecl => parsed::TypedefKind(parsed::Typedef::from(&entity)),
+            clang::EntityKind::UnionDecl => parsed::UnionKind(parsed::Union::from(&entity)),
+            clang::EntityKind::VarDecl => parsed::VariableKind(parsed::Variable::from(&entity)),
             _ => continue,
         };
-        file.items.push(parsed::Item {
+        file.add_item(parsed::Item {
             compilationunit: compilationunit.clone(),
             name: entity.get_name(),
+            // TODO: support comments in the same line as the code
             comment: entity.get_comment(),
             kind,
+            code: entity.get_pretty_printer().print(),
         });
-
-        //println!("{:?}", entity.get_parsed_comment());
-
-        /*println!(
-            "{:?} {:?}: {:#?}",
-            entity.get_location().map(|loc| loc.get_presumed_location()),
-            entity.get_kind(),
-            entity.get_parsed_comment()
-        );*/
     }
 
     Ok(())
@@ -315,41 +298,54 @@ where
     write!(w, "</div>")
 }
 
-fn write_documentation<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std::fmt::Result {
-    if let Some(comment) = &item.comment {
-        write!(f, "<div class=\"docblock\"><pre>{}</pre></div>", comment)?;
+fn write_documentation<W: std::fmt::Write>(
+    f: &mut W,
+    comment: Option<&String>,
+) -> std::fmt::Result {
+    if let Some(comment) = comment {
+        let mut singleline = true;
+        let mut comment = comment.trim();
+        if comment.starts_with("/**") {
+            singleline = false;
+            comment = comment[3..comment.len() - 2].trim();
+        }
+
+        write!(f, "<div class=\"docblock\"><p>")?;
+        let mut first = true;
+        for mut line in comment.lines() {
+            line = line.trim();
+
+            if singleline {
+                if line.starts_with("///") {
+                    line = line[3..].trim();
+                }
+            } else {
+                if line.starts_with("*") {
+                    line = line[1..].trim();
+                }
+            }
+
+            if line.is_empty() {
+                if !first {
+                    write!(f, "</p><p>")?;
+                }
+                continue;
+            }
+
+            write!(f, "{} ", line)?;
+
+            if first {
+                write!(f, "</p><p>")?;
+                first = false;
+            }
+        }
+        write!(f, "</p></div>")?;
     }
     Ok(())
 }
 
-fn write_struct<W: std::fmt::Write>(
-    f: &mut W,
-    item: &parsed::Item,
-    s: &parsed::Struct,
-) -> std::fmt::Result {
-    wrap_into_docblock(f, |f| {
-        write!(f, "<pre class=\"rust struct\">")?;
-        //render_attributes(w, it, true);
-        /*render_struct(
-            w,
-            it,
-            Some(&s.generics),
-            s.struct_type,
-            &s.fields,
-            "",
-            true,
-            cx,
-        );*/
-        write!(f, "</pre>")
-    })?;
-    write_documentation(f, item)?;
-
-    write!(
-        f,
-        "<h2 id=\"fields\" class=\"fields small-section-header\">
-                       Fields<a href=\"#fields\" class=\"anchor\"></a></h2>",
-    )?;
-    for field in &s.fields {
+fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std::fmt::Result {
+    for field in fields {
         let id = format!("structfield.{}", field.name);
         write!(
             f,
@@ -360,9 +356,99 @@ fn write_struct<W: std::fmt::Write>(
             item_type = ItemType::StructField,
             id = id,
             name = field.name,
-            ty = field.ty,
+            ty = format::display_fn(|f| match &field.ty {
+                parsed::FieldType::String(s) => f.write_str(s),
+                parsed::FieldType::Struct(..) =>
+                    write!(f, "{}", escape::Escape("<<anonymous struct>>")),
+                parsed::FieldType::Union(..) =>
+                    write!(f, "{}", escape::Escape("<<anonymous union>>")),
+            }),
         )?;
-        write_documentation(f, item)?;
+        write_documentation(f, field.comment.as_ref())?;
+
+        match &field.ty {
+            parsed::FieldType::Struct(parsed::Struct { fields, .. })
+            | parsed::FieldType::Union(parsed::Union { fields, .. }) => {
+                if !fields.is_empty() {
+                    write!(
+                        f,
+                        "<div class=\"autohide sub-variant\" id=\"{id}\">",
+                        id = ""
+                    )?;
+                    write!(
+                        f,
+                        "<h3>Fields of <b>{name}</b></h3><div>",
+                        name = field.name
+                    )?;
+
+                    write_fields(f, fields)?;
+
+                    write!(f, "</div></div>")?;
+                }
+            }
+            _ => (),
+        }
+    }
+
+    Ok(())
+}
+
+fn write_struct_or_union<W: std::fmt::Write>(
+    f: &mut W,
+    item: &parsed::Item,
+    fields: &[parsed::Field],
+) -> std::fmt::Result {
+    wrap_into_docblock(f, |f| {
+        write!(
+            f,
+            "<pre class=\"rust {}\">{}</pre>",
+            ItemType::from(&item.kind),
+            item.code
+        )
+    })?;
+    write_documentation(f, item.comment.as_ref())?;
+
+    if !fields.is_empty() {
+        write!(
+            f,
+            "<h2 id=\"fields\" class=\"fields small-section-header\">
+                       Fields<a href=\"#fields\" class=\"anchor\"></a></h2>",
+        )?;
+        write_fields(f, fields)?;
+    }
+
+    Ok(())
+}
+
+fn write_enum<W: std::fmt::Write>(
+    f: &mut W,
+    item: &parsed::Item,
+    e: &parsed::Enum,
+) -> std::fmt::Result {
+    wrap_into_docblock(f, |f| {
+        write!(f, "<pre class=\"rust enum\">{};</pre>", item.code)
+    })?;
+    write_documentation(f, item.comment.as_ref())?;
+
+    if !e.variants.is_empty() {
+        write!(
+            f,
+            "<h2 id=\"variants\" class=\"variants small-section-header\">
+                   Variants<a href=\"#variants\" class=\"anchor\"></a></h2>\n"
+        )?;
+
+        for variant in &e.variants {
+            let id = format!("{}.{}", ItemType::Variant, variant.name);
+            write!(
+                f,
+                "<div id=\"{id}\" class=\"variant small-section-header\">\
+                    <a href=\"#{id}\" class=\"anchor field\"></a>\
+                    <code>{name}</code></div>",
+                id = id,
+                name = variant.name,
+            )?;
+            write_documentation(f, variant.comment.as_ref())?;
+        }
     }
 
     Ok(())
@@ -371,14 +457,36 @@ fn write_struct<W: std::fmt::Write>(
 fn write_function<W: std::fmt::Write>(
     f: &mut W,
     item: &parsed::Item,
-    func: &parsed::Function,
+    _func: &parsed::Function,
 ) -> std::fmt::Result {
-    wrap_into_docblock(f, |f| {
-        write!(f, "<pre class=\"rust fn\">")?;
+    write!(
+        f,
+        "<pre class=\"rust fn\">{};</pre>",
+        item.code.split("{").collect::<Vec<_>>()[0].trim()
+    )?;
+    write_documentation(f, item.comment.as_ref())?;
 
-        write!(f, "</pre>")
-    })?;
-    write_documentation(f, item)?;
+    Ok(())
+}
+
+fn write_typedef<W: std::fmt::Write>(
+    f: &mut W,
+    item: &parsed::Item,
+    _typedef: &parsed::Typedef,
+) -> std::fmt::Result {
+    write!(f, "<pre class=\"rust type\">{};</pre>", item.code)?;
+    write_documentation(f, item.comment.as_ref())?;
+
+    Ok(())
+}
+
+fn write_variable<W: std::fmt::Write>(
+    f: &mut W,
+    item: &parsed::Item,
+    _variable: &parsed::Variable,
+) -> std::fmt::Result {
+    write!(f, "<pre class=\"rust variable\">{};</pre>", item.code)?;
+    write_documentation(f, item.comment.as_ref())?;
 
     Ok(())
 }
@@ -421,9 +529,12 @@ fn write_page_content<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std
     write!(f, "</span></h1>")?; // in-band
 
     match &item.kind {
-        parsed::StructKind(s) => write_struct(f, item, s)?,
+        parsed::EnumKind(func) => write_enum(f, item, func)?,
         parsed::FunctionKind(func) => write_function(f, item, func)?,
-        _ => (),
+        parsed::StructKind(s) => write_struct_or_union(f, item, &s.fields)?,
+        parsed::UnionKind(s) => write_struct_or_union(f, item, &s.fields)?,
+        parsed::TypedefKind(typedef) => write_typedef(f, item, typedef)?,
+        parsed::VariableKind(variable) => write_variable(f, item, variable)?,
     }
 
     Ok(())
@@ -558,7 +669,7 @@ fn main() -> Result<(), Error> {
         process_file(command, &clang, &mut files)?;
     }
     std::env::set_current_dir(&cwd)?;
-    println!("{:#?}", files);
+    //println!("{:#?}", files);
 
     copy_statics(&dst)?;
 
@@ -578,7 +689,11 @@ fn main() -> Result<(), Error> {
 
     for file in files.list.values() {
         for item in &file.items {
-            write_item(&dst, item)?;
+            if item.name.is_some() {
+                write_item(&dst, item)?;
+            } else {
+                println!("NAMELESS: {:?}", item.code);
+            }
         }
     }
 

@@ -2615,7 +2615,7 @@ function defocusSearchBar() {
                     });
                 }
             }
-            if (e.parentNode.id === "main") {
+            if (e.parentNode.id === "main" || hasClass(e, "sub-variant")) {
                 var otherMessage = "";
                 var fontSize;
                 var extraClass;

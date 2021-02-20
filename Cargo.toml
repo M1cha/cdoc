@@ -5,7 +5,7 @@ authors = ["Michael Zimmermann <sigmaepsilon92@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-clang = "^1.0"
+clang = { version="^1.0", features=["clang_7_0"] }
 serde = { version="^1.0", features=["derive"] }
 serde_json = "^1.0"
 tempfile = "^3.2"
