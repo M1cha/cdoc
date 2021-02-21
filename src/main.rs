@@ -45,7 +45,7 @@ fn process_file(
     }
 
     std::env::set_current_dir(&command.directory)?;
-    let compilationunit = std::fs::canonicalize(&command.file)?;
+    let compilationunit = std::sync::Arc::new(std::fs::canonicalize(&command.file)?);
     //let outpath = std::path::Path::new("/tmp/cdoc.c");
     let outpath = std::path::PathBuf::from(format!(
         "/tmp/cdoc-{}.c",

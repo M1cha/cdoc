@@ -142,7 +142,7 @@ pub(crate) enum ItemKind {
 
 #[derive(Debug)]
 pub(crate) struct Item {
-    pub(crate) compilationunit: std::path::PathBuf,
+    pub(crate) compilationunit: std::sync::Arc<std::path::PathBuf>,
     pub(crate) name: Option<String>,
     pub(crate) comment: Option<String>,
     pub(crate) kind: ItemKind,
