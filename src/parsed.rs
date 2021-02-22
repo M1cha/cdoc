@@ -1,12 +1,28 @@
 pub(crate) use self::ItemKind::*;
 
+macro_rules! unwrap_enum {
+    ($expression:expr, $ident:ident) => {
+        match $expression {
+            $ident(v) => v,
+            _ => unreachable!(),
+        }
+    };
+}
+
+#[enum_dispatch::enum_dispatch]
+trait ItemKindFns {
+    /// if the other itemkind is similar enough, extend this item with it's data and return true
+    /// Otherwise, return false
+    fn try_update(&mut self, other: &ItemKind) -> bool;
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct EnumVariant {
     pub(crate) name: String,
     pub(crate) comment: Option<String>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct Enum {
     pub(crate) variants: Vec<EnumVariant>,
 }
@@ -27,7 +43,15 @@ impl From<&clang::Entity<'_>> for Enum {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl ItemKindFns for Enum {
+    fn try_update(&mut self, other: &ItemKind) -> bool {
+        let other = unwrap_enum!(other, EnumKind);
+
+        self.variants == other.variants
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct Function {
     pub(crate) ty: String,
 }
@@ -37,6 +61,18 @@ impl From<&clang::Entity<'_>> for Function {
         Self {
             ty: entity.get_type().unwrap().get_display_name(),
         }
+    }
+}
+
+impl ItemKindFns for Function {
+    fn try_update(&mut self, other: &ItemKind) -> bool {
+        let other = unwrap_enum!(other, FunctionKind);
+
+        if self.ty != other.ty {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -88,19 +124,45 @@ impl From<&clang::Entity<'_>> for Struct {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl ItemKindFns for Struct {
+    fn try_update(&mut self, other: &ItemKind) -> bool {
+        let other = unwrap_enum!(other, StructKind);
+        self.fields == other.fields
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct Typedef {
     pub(crate) ty: String,
+    pub(crate) anonymous_ty: Option<(Box<ItemKind>, String)>,
 }
 
 impl From<&clang::Entity<'_>> for Typedef {
     fn from(entity: &clang::Entity<'_>) -> Self {
-        Self {
-            ty: entity
-                .get_typedef_underlying_type()
-                .unwrap()
-                .get_display_name(),
+        let ty = entity.get_typedef_underlying_type().unwrap();
+
+        // store anonymous type behind typedef
+        let mut anonymous_ty = None;
+        if let Some(elaborated_type) = ty.get_elaborated_type() {
+            if let Some(decl) = elaborated_type.get_declaration() {
+                if decl.get_name().is_none() {
+                    let code = decl.get_pretty_printer().print();
+                    anonymous_ty = ItemKind::from_entity(&decl).map(|o| (Box::new(o), code));
+                }
+            }
         }
+
+        Self {
+            ty: ty.get_display_name(),
+            anonymous_ty,
+        }
+    }
+}
+
+impl ItemKindFns for Typedef {
+    fn try_update(&mut self, other: &ItemKind) -> bool {
+        let other = unwrap_enum!(other, TypedefKind);
+        self.ty == other.ty
     }
 }
 
@@ -117,7 +179,14 @@ impl From<&clang::Entity<'_>> for Union {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl ItemKindFns for Union {
+    fn try_update(&mut self, other: &ItemKind) -> bool {
+        let other = unwrap_enum!(other, UnionKind);
+        self.fields == other.fields
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct Variable {
     pub(crate) ty: String,
 }
@@ -130,7 +199,15 @@ impl From<&clang::Entity<'_>> for Variable {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl ItemKindFns for Variable {
+    fn try_update(&mut self, other: &ItemKind) -> bool {
+        let other = unwrap_enum!(other, VariableKind);
+        self.ty == other.ty
+    }
+}
+
+#[enum_dispatch::enum_dispatch(ItemKindFns)]
+#[derive(Debug)]
 pub(crate) enum ItemKind {
     EnumKind(Enum),
     FunctionKind(Function),
@@ -140,22 +217,43 @@ pub(crate) enum ItemKind {
     VariableKind(Variable),
 }
 
+impl ItemKind {
+    pub(crate) fn from_entity(entity: &clang::Entity<'_>) -> Option<Self> {
+        Some(match entity.get_kind() {
+            clang::EntityKind::EnumDecl => EnumKind(Enum::from(entity)),
+            clang::EntityKind::FunctionDecl => FunctionKind(Function::from(entity)),
+            clang::EntityKind::StructDecl => StructKind(Struct::from(entity)),
+            clang::EntityKind::TypedefDecl => TypedefKind(Typedef::from(entity)),
+            clang::EntityKind::UnionDecl => UnionKind(Union::from(entity)),
+            clang::EntityKind::VarDecl => VariableKind(Variable::from(entity)),
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn eq_outer(&self, other: &Self) -> bool {
+        match self {
+            EnumKind(..) => matches!(other, Self::EnumKind(..)),
+            FunctionKind(..) => matches!(other, Self::FunctionKind(..)),
+            StructKind(..) => matches!(other, Self::StructKind(..)),
+            TypedefKind(..) => matches!(other, Self::TypedefKind(..)),
+            UnionKind(..) => matches!(other, Self::UnionKind(..)),
+            VariableKind(..) => matches!(other, Self::VariableKind(..)),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Item {
+    /// the file that was compiled to obtain this item
     pub(crate) compilationunit: std::sync::Arc<std::path::PathBuf>,
+    /// the file that this item was found in
+    pub(crate) file: std::path::PathBuf,
     pub(crate) name: Option<String>,
     pub(crate) comment: Option<String>,
     pub(crate) kind: ItemKind,
     pub(crate) code: String,
-}
 
-impl PartialEq for Item {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.comment == other.comment
-            && self.kind == other.kind
-            && self.code == other.code
-    }
+    pub(crate) duplicates: Vec<Item>,
 }
 
 impl Item {
@@ -165,31 +263,36 @@ impl Item {
 }
 
 #[derive(Default, Debug)]
-pub(crate) struct File {
+pub(crate) struct ItemList {
     pub(crate) items: Vec<Item>,
 }
 
-impl File {
-    pub(crate) fn add_item(&mut self, item: Item) {
-        if !self.items.contains(&item) {
-            self.items.push(item);
+impl ItemList {
+    pub(crate) fn push(&mut self, new_item: Item) {
+        for item in &mut self.items {
+            if !item.kind.eq_outer(&new_item.kind) {
+                continue;
+            }
+            if item.name != new_item.name {
+                continue;
+            }
+
+            // check if they are the same. Depending on the implementation this
+            // add information from the new one to the old one if they were missing there.
+            if item.kind.try_update(&new_item.kind) {
+                // sometimes the comment is on the implementation.
+                // libclang will give us the documentation on the header item anyway
+                // so we can copy that into the public documentation
+                if item.comment.is_none() && new_item.comment.is_some() {
+                    item.comment = new_item.comment;
+                }
+                return;
+            }
+
+            item.duplicates.push(new_item);
+            return;
         }
-    }
-}
 
-#[derive(Default, Debug)]
-pub(crate) struct Files {
-    pub(crate) list: std::collections::HashMap<std::path::PathBuf, File>,
-}
-
-impl Files {
-    pub fn for_path<'a, P: AsRef<std::path::Path>>(&'a mut self, path: P) -> &'a mut File {
-        let path = path.as_ref();
-
-        if !self.list.contains_key(path) {
-            self.list.insert(path.to_path_buf(), File::default());
-        }
-
-        self.list.get_mut(path).unwrap()
+        self.items.push(new_item);
     }
 }
