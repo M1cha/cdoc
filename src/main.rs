@@ -196,7 +196,6 @@ fn process_file(
             compilationunit: compilationunit.clone(),
             file: abspath,
             name: entity.get_name(),
-            // TODO: support comments in the same line as the code
             comment,
             kind,
             code,
