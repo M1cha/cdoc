@@ -4,6 +4,7 @@
 // TODO: we scan skip nameless types, but for enums they would be useful since they're still usable
 //       due to anonymous typedef which show up as an antity we need a way to find out if we added
 //       such an item as part of a typedef already.
+// TODO: unnamed union fields (__esf)
 
 mod escape;
 mod format;
@@ -120,16 +121,22 @@ fn process_file(
 
         let abspath = std::fs::canonicalize(loc.0)?;
         if abspath.extension() != Some(std::ffi::OsStr::new("h")) {
-            return Ok(());
+            continue;
         }
 
-        if !entity.is_definition() {
+        // untested better version:
+        if entity != entity.get_canonical_entity() {
+            continue;
+        }
+        /*if !entity.is_definition() {
             match entity.get_kind() {
                 clang::EntityKind::FunctionDecl => (),
                 clang::EntityKind::VarDecl => (),
+                // this is a forward decl from e.g. a struct
+                // this wouldn't give us enough information to build documentation.
                 _ => continue,
             }
-        }
+        }*/
 
         /*println!(
             "{:#?}",
@@ -152,7 +159,7 @@ fn process_file(
         /*compilationunit.ends_with("fdtable.c")
         &&*/
         entity.get_name().as_ref() == Some(&"I2S_RXD_Type".to_string()) {
-            println!("{:#?}", entity);
+            //println!("{:#?}", entity);
         }
 
         let mut comment = entity.get_comment();
@@ -419,49 +426,80 @@ fn write_documentation<W: std::fmt::Write>(
     Ok(())
 }
 
+fn write_itemkind_fields<W: std::fmt::Write, N: std::fmt::Display>(
+    f: &mut W,
+    name: N,
+    itemkind: &parsed::ItemKind,
+) -> std::fmt::Result {
+    match &itemkind {
+        parsed::StructKind(parsed::Struct { fields, .. })
+        | parsed::UnionKind(parsed::Union { fields, .. }) => {
+            if !fields.is_empty() {
+                write!(
+                    f,
+                    "<div class=\"autohide sub-variant\" id=\"{id}\">",
+                    id = ""
+                )?;
+                write!(f, "<h3>Fields of <b>{name}</b></h3><div>", name = name)?;
+
+                write_fields(f, fields)?;
+
+                write!(f, "</div></div>")?;
+            }
+        }
+        _ => panic!("unsupported field declaration type: {:#?}", itemkind),
+    }
+
+    Ok(())
+}
+
 fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std::fmt::Result {
-    for field in fields {
-        let id = format!("structfield.{}", field.name);
+    for (index, field) in fields.iter().enumerate() {
+        let id = if let Some(name) = &field.name {
+            format!("structfield.{}", name)
+        } else {
+            format!("structfield-anonymous.{}", index)
+        };
+        let name = field
+            .name
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("&lt;&lt;anonymous&gt;&gt;");
         write!(
             f,
             "<span id=\"{id}\" class=\"{item_type} small-section-header\">\
                          <a href=\"#{id}\" class=\"anchor field\"></a>\
                          <code>{name}: {ty}</code>\
                      </span>",
+            // TODO: use correct itemtype
             item_type = ItemType::StructField,
             id = id,
-            name = field.name,
-            ty = format::display_fn(|f| match &field.ty {
-                parsed::FieldType::String(s) => f.write_str(s),
-                parsed::FieldType::Struct(..) =>
-                    write!(f, "{}", escape::Escape("<<anonymous struct>>")),
-                parsed::FieldType::Union(..) =>
-                    write!(f, "{}", escape::Escape("<<anonymous union>>")),
-            }),
+            name = name,
+            ty = field.ty.kind, /*format::display_fn(|f| match &field.ty {
+                                    parsed::FieldType::String(s) => f.write_str(s),
+                                    parsed::FieldType::Struct(..) =>
+                                        write!(f, "{}", escape::Escape("<<anonymous struct>>")),
+                                    parsed::FieldType::Union(..) =>
+                                        write!(f, "{}", escape::Escape("<<anonymous union>>")),
+                                })*/
         )?;
         write_documentation(f, field.comment.as_ref())?;
 
-        match &field.ty {
-            parsed::FieldType::Struct(parsed::Struct { fields, .. })
-            | parsed::FieldType::Union(parsed::Union { fields, .. }) => {
-                if !fields.is_empty() {
-                    write!(
-                        f,
-                        "<div class=\"autohide sub-variant\" id=\"{id}\">",
-                        id = ""
-                    )?;
-                    write!(
-                        f,
-                        "<h3>Fields of <b>{name}</b></h3><div>",
-                        name = field.name
-                    )?;
+        if let Some(itemkind) = field.ty.kind.innermost_anonymous() {
+            write_itemkind_fields(
+                f,
+                format!("&lt;&lt;anonymous {}&gt;&gt;", itemkind.keyword().unwrap()),
+                &itemkind,
+            )?;
+        }
 
-                    write_fields(f, fields)?;
-
-                    write!(f, "</div></div>")?;
-                }
-            }
-            _ => (),
+        for decl in &field.declarations {
+            write_documentation(f, decl.comment.as_ref())?;
+            write_itemkind_fields(
+                f,
+                format!("{} {}", decl.kind.keyword().unwrap(), decl.name),
+                &decl.kind,
+            )?;
         }
     }
 

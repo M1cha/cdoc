@@ -1,9 +1,3 @@
-pub(crate) fn display_fn(
-    f: impl FnOnce(&mut std::fmt::Formatter<'_>) -> std::fmt::Result,
-) -> impl std::fmt::Display {
-    WithFormatter(std::cell::Cell::new(Some(f)))
-}
-
 pub(crate) struct IoWriteFormatter<W> {
     writer: W,
 }
@@ -18,6 +12,12 @@ impl<W: std::io::Write> std::fmt::Write for IoWriteFormatter<W> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
         write!(self.writer, "{}", s).map_err(|_| std::fmt::Error)
     }
+}
+
+pub(crate) fn display_fn(
+    f: impl FnOnce(&mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+) -> impl std::fmt::Display {
+    WithFormatter(std::cell::Cell::new(Some(f)))
 }
 
 pub(crate) struct WithFormatter<F>(std::cell::Cell<Option<F>>);
