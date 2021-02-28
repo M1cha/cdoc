@@ -53,8 +53,9 @@ fn get_comment(entity: &clang::Entity<'_>) -> Result<Option<String>, crate::Erro
     Ok(comment)
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) struct ItemRef {
-    path: Vec<(String, crate::ItemType)>,
+    pub(crate) path: Vec<(String, crate::ItemType)>,
 }
 
 impl From<&clang::Entity<'_>> for ItemRef {
@@ -72,7 +73,9 @@ impl From<&clang::Entity<'_>> for ItemRef {
                         clang::EntityKind::UnionDecl => crate::ItemType::Union,
                         clang::EntityKind::ClassDecl => crate::ItemType::Class,
                         clang::EntityKind::Namespace => crate::ItemType::Namespace,
-                        _ => unimplemented!(),
+                        clang::EntityKind::EnumDecl => crate::ItemType::Enum,
+                        clang::EntityKind::TypedefDecl => crate::ItemType::Typedef,
+                        _ => unimplemented!("{:?}", kind),
                     };
 
                     path.push((current.get_name().unwrap(), itemtype));
@@ -97,6 +100,9 @@ impl Context {
             // apparently is_anonymous can return false for nameless typedef
             // structs.
             if entity.get_name().is_none() {
+                continue;
+            }
+            if entity.is_anonymous() {
                 continue;
             }
 
@@ -141,9 +147,25 @@ trait ItemKindFns {
 }
 
 #[derive(Debug, PartialEq)]
+pub(crate) enum EnumValue {
+    Signed(i64),
+    Unsigned(u64),
+}
+
+impl std::fmt::Display for EnumValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Signed(n) => n.fmt(f),
+            Self::Unsigned(n) => n.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub(crate) struct EnumVariant {
     pub(crate) name: String,
     pub(crate) comment: Option<String>,
+    pub(crate) value: Option<EnumValue>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -158,9 +180,22 @@ impl From<&clang::Entity<'_>> for Enum {
                 .get_children()
                 .iter()
                 .filter(|entity| entity.get_kind() == clang::EntityKind::EnumConstantDecl)
-                .map(|entity| EnumVariant {
-                    name: entity.get_display_name().unwrap(),
-                    comment: get_comment(entity).unwrap(),
+                .map(|variant_entity| EnumVariant {
+                    name: variant_entity.get_display_name().unwrap(),
+                    comment: get_comment(variant_entity).unwrap(),
+                    value: variant_entity
+                        .get_enum_constant_value()
+                        .map(|(signed, unsigned)| {
+                            if entity
+                                .get_enum_underlying_type()
+                                .unwrap()
+                                .is_signed_integer()
+                            {
+                                EnumValue::Signed(signed)
+                            } else {
+                                EnumValue::Unsigned(unsigned)
+                            }
+                        }),
                 })
                 .collect(),
         }
@@ -177,13 +212,33 @@ impl ItemKindFns for Enum {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Function {
-    pub(crate) ty: String,
+    pub(crate) arguments: Vec<(String, Type)>,
+    pub(crate) result: Box<Type>,
+    pub(crate) is_variadic: bool,
 }
 
-impl From<&clang::Entity<'_>> for Function {
-    fn from(entity: &clang::Entity<'_>) -> Self {
+impl Function {
+    fn from_entity(
+        entity: &clang::Entity<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Self {
         Self {
-            ty: entity.get_type().unwrap().get_display_name(),
+            arguments: entity
+                .get_arguments()
+                .unwrap()
+                .iter()
+                .map(|arg_entity| {
+                    (
+                        arg_entity.get_name().unwrap(),
+                        Type::from_clangtype(&arg_entity.get_type().unwrap(), compilationunit),
+                    )
+                })
+                .collect(),
+            result: Box::new(Type::from_clangtype(
+                &entity.get_result_type().unwrap(),
+                compilationunit,
+            )),
+            is_variadic: entity.is_variadic(),
         }
     }
 }
@@ -192,68 +247,133 @@ impl ItemKindFns for Function {
     fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, FunctionKind);
 
-        if self.ty != other.ty {
-            return false;
-        }
-
-        true
+        self == other
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum TypeKind {
     Unknown(String),
-    Struct(String),
-    Union(String),
-    Enum(String),
-    Anonymous(ItemKind),
-    Pointer { isconst: bool, ty: Box<Type> },
+    ItemRef(ItemRef),
+    Anonymous(Item),
+    Pointer(Box<Type>),
     ConstantArray { len: usize, ty: Box<Type> },
-}
-
-impl TypeKind {
-    pub(crate) fn innermost_anonymous(&self) -> Option<&ItemKind> {
-        match self {
-            Self::Anonymous(itemkind) => Some(itemkind),
-            Self::Pointer { ty, .. } | Self::ConstantArray { ty, .. } => {
-                ty.kind.innermost_anonymous()
-            }
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Type {
-    //attributes: Vec<>,
+    pub(crate) isconst: bool,
     pub(crate) kind: TypeKind,
 }
 
-impl From<&clang::Type<'_>> for Type {
-    fn from(clangty: &clang::Type<'_>) -> Self {
+impl Type {
+    pub(crate) fn print<W: std::fmt::Write>(
+        &self,
+        w: &mut W,
+        mut f: impl FnMut(&mut W, &ItemRef) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        match &self.kind {
+            TypeKind::Unknown(s) => w.write_str(s)?,
+            TypeKind::ItemRef(itemref) => f(w, itemref)?,
+            TypeKind::Anonymous(item) => write!(w, "ANON")?,
+            TypeKind::Pointer(ty) => {
+                w.write_str("ptr(")?;
+                ty.print(w, f)?;
+                w.write_str(")")?;
+            }
+            TypeKind::ConstantArray { len, ty } => {
+                w.write_str("[")?;
+                ty.print(w, f)?;
+                write!(w, "; {}]", len)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clangty_to_primitive_str(clangty: &clang::TypeKind) -> Option<&'static str> {
+        Some(match clangty {
+            clang::TypeKind::Void => "void",
+            clang::TypeKind::Bool => "bool",
+            clang::TypeKind::CharS | clang::TypeKind::CharU => "char",
+            clang::TypeKind::SChar => "signed char",
+            clang::TypeKind::UChar => "unsigned char",
+            clang::TypeKind::Char16 => "char16_t",
+            clang::TypeKind::Char32 => "char32_t",
+            clang::TypeKind::Short => "short",
+            clang::TypeKind::UShort => "unsigned short",
+            clang::TypeKind::Int => "int",
+            clang::TypeKind::UInt => "unsigned int",
+            clang::TypeKind::Long => "long",
+            clang::TypeKind::ULong => "unsigned long",
+            clang::TypeKind::LongLong => "long long",
+            clang::TypeKind::ULongLong => "unsigned long long",
+            clang::TypeKind::Int128 => "__int128_t",
+            clang::TypeKind::UInt128 => "__uint128_t",
+            clang::TypeKind::Float => "float",
+            clang::TypeKind::Double => "double",
+            clang::TypeKind::Nullptr => "nullptr_t",
+            clang::TypeKind::Float128 => "__float128",
+            _ => return None,
+        })
+    }
+
+    fn from_clangtype(
+        clangty: &clang::Type<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Self {
+        let tydecl = clangty.get_declaration();
+        let is_anonymous = tydecl
+            .as_ref()
+            .map(|tydecl| tydecl.is_anonymous() || tydecl.get_name().is_none())
+            .unwrap_or(false);
+        //println!("DECL: {:?} ANON:{:?}", tydecl, is_anonymous);
         Self {
-            kind: {
-                let tydecl = clangty.get_declaration();
-                let is_anonymous = tydecl
-                    .as_ref()
-                    .map(|tydecl| tydecl.is_anonymous())
-                    .unwrap_or(false);
-                if is_anonymous {
-                    TypeKind::Anonymous(ItemKind::from_entity(&tydecl.unwrap()).unwrap())
-                } else {
-                    match &clangty.get_kind() {
-                        clang::TypeKind::ConstantArray => TypeKind::ConstantArray {
-                            len: clangty.get_size().unwrap(),
-                            ty: Box::new(Self::from(&clangty.get_element_type().unwrap())),
-                        },
-                        clang::TypeKind::Pointer => TypeKind::Pointer {
-                            isconst: clangty.is_const_qualified(),
-                            ty: Box::new(Self::from(&clangty.get_pointee_type().unwrap())),
-                        },
-                        clang::TypeKind::Elaborated => {
-                            TypeKind::Unknown(format!("{:?}", clangty.get_elaborated_type()))
+            isconst: clangty.is_const_qualified(),
+            kind: if is_anonymous {
+                TypeKind::Anonymous(
+                    Item::from_entity(&tydecl.unwrap(), compilationunit)
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                match &clangty.get_kind() {
+                    clang::TypeKind::ConstantArray => TypeKind::ConstantArray {
+                        len: clangty.get_size().unwrap(),
+                        ty: Box::new(Self::from_clangtype(
+                            &clangty.get_element_type().unwrap(),
+                            compilationunit,
+                        )),
+                    },
+
+                    clang::TypeKind::Pointer => TypeKind::Pointer(Box::new(Self::from_clangtype(
+                        &clangty.get_pointee_type().unwrap(),
+                        compilationunit,
+                    ))),
+
+                    clang::TypeKind::Elaborated => TypeKind::ItemRef(ItemRef::from(
+                        &clangty
+                            .get_elaborated_type()
+                            .unwrap()
+                            .get_declaration()
+                            .unwrap(),
+                    )),
+
+                    clang::TypeKind::Record | clang::TypeKind::Typedef => {
+                        TypeKind::ItemRef(ItemRef::from(&clangty.get_declaration().unwrap()))
+                    }
+
+                    unknown => {
+                        if let Some(s) = Self::clangty_to_primitive_str(unknown) {
+                            TypeKind::ItemRef(ItemRef {
+                                path: vec![(s.to_string(), crate::ItemType::Primitive)],
+                            })
+                        } else {
+                            TypeKind::Unknown(format!(
+                                "{}({:?})",
+                                clangty.get_display_name(),
+                                clangty
+                            ))
                         }
-                        _ => TypeKind::Unknown(format!("{:?}", clangty)),
                     }
                 }
             },
@@ -261,36 +381,10 @@ impl From<&clang::Type<'_>> for Type {
     }
 }
 
-impl std::fmt::Display for TypeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TypeKind::Unknown(s) => f.write_str(s),
-            TypeKind::Struct(s) => write!(f, "struct {}", s),
-            TypeKind::Union(s) => write!(f, "union {}", s),
-            TypeKind::Enum(s) => write!(f, "enum {}", s),
-            TypeKind::Anonymous(itemkind) => write!(
-                f,
-                "{}",
-                crate::escape::Escape(match itemkind {
-                    StructKind(..) => "<<anonymous struct>>",
-                    EnumKind(..) => "<<anonymous enum>>",
-                    UnionKind(..) => "<<anonymous union>>",
-                    _ => "<<unsupported anonymous>>",
-                })
-            ),
-            TypeKind::Pointer { isconst, ty } => {
-                write!(f, "{}ptr({})", if *isconst { "const" } else { "" }, ty.kind)
-            }
-            TypeKind::ConstantArray { len, ty } => write!(f, "[{}; {}]", ty.kind, len),
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub(crate) struct Field {
     pub(crate) name: Option<String>,
-    //pub(crate) ty: Type,
-    pub(crate) ty: String,
+    pub(crate) ty: Type,
     pub(crate) comment: Option<String>,
 }
 
@@ -300,7 +394,10 @@ pub(crate) struct Struct {
     pub(crate) items: Vec<Item>,
 }
 
-fn get_fields(container_entity: &clang::Entity<'_>) -> Vec<Field> {
+fn get_fields(
+    container_entity: &clang::Entity<'_>,
+    compilationunit: &std::sync::Arc<std::path::PathBuf>,
+) -> Vec<Field> {
     let ty = container_entity.get_type().unwrap();
     let fields = ty.get_fields().unwrap();
 
@@ -308,17 +405,19 @@ fn get_fields(container_entity: &clang::Entity<'_>) -> Vec<Field> {
         .iter()
         .map(|entity| Field {
             name: entity.get_display_name(),
-            //ty: Type::from(&entity.get_type().unwrap()),
-            ty: entity.get_type().unwrap().get_display_name(),
+            ty: Type::from_clangtype(&entity.get_type().unwrap(), compilationunit),
             comment: entity.get_comment(),
         })
         .collect()
 }
 
-impl From<&clang::Entity<'_>> for Struct {
-    fn from(entity: &clang::Entity<'_>) -> Self {
+impl Struct {
+    fn from_entity(
+        entity: &clang::Entity<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Self {
         Self {
-            fields: get_fields(entity),
+            fields: get_fields(entity, compilationunit),
             items: Vec::new(),
         }
     }
@@ -341,28 +440,17 @@ impl ItemKindFns for Struct {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Typedef {
-    pub(crate) ty: String,
-    pub(crate) anonymous_ty: Option<(Box<ItemKind>, String)>,
+    pub(crate) ty: Box<Type>,
 }
 
-impl From<&clang::Entity<'_>> for Typedef {
-    fn from(entity: &clang::Entity<'_>) -> Self {
+impl Typedef {
+    fn from_entity(
+        entity: &clang::Entity<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Self {
         let ty = entity.get_typedef_underlying_type().unwrap();
-
-        // store anonymous type behind typedef
-        let mut anonymous_ty = None;
-        if let Some(elaborated_type) = ty.get_elaborated_type() {
-            if let Some(decl) = elaborated_type.get_declaration() {
-                if decl.get_name().is_none() {
-                    let code = decl.get_pretty_printer().print();
-                    anonymous_ty = ItemKind::from_entity(&decl).map(|o| (Box::new(o), code));
-                }
-            }
-        }
-
         Self {
-            ty: ty.get_display_name(),
-            anonymous_ty,
+            ty: Box::new(Type::from_clangtype(&ty, compilationunit)),
         }
     }
 }
@@ -380,10 +468,13 @@ pub(crate) struct Union {
     pub(crate) items: Vec<Item>,
 }
 
-impl From<&clang::Entity<'_>> for Union {
-    fn from(entity: &clang::Entity<'_>) -> Self {
+impl Union {
+    fn from_entity(
+        entity: &clang::Entity<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Self {
         Self {
-            fields: get_fields(entity),
+            fields: get_fields(entity, compilationunit),
             items: Vec::new(),
         }
     }
@@ -406,14 +497,20 @@ impl ItemKindFns for Union {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Variable {
-    pub(crate) ty: String,
+    pub(crate) ty: Box<Type>,
 }
 
-impl From<&clang::Entity<'_>> for Variable {
-    fn from(entity: &clang::Entity<'_>) -> Self {
+impl Variable {
+    fn from_entity(
+        entity: &clang::Entity<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Self {
         {
             Self {
-                ty: entity.get_type().unwrap().get_display_name(),
+                ty: Box::new(Type::from_clangtype(
+                    &entity.get_type().unwrap(),
+                    compilationunit,
+                )),
             }
         }
     }
@@ -462,18 +559,6 @@ pub(crate) enum ItemKind {
 }
 
 impl ItemKind {
-    pub(crate) fn from_entity(entity: &clang::Entity<'_>) -> Option<Self> {
-        Some(match entity.get_kind() {
-            clang::EntityKind::EnumDecl => EnumKind(Enum::from(entity)),
-            clang::EntityKind::FunctionDecl => FunctionKind(Function::from(entity)),
-            clang::EntityKind::StructDecl => StructKind(Struct::from(entity)),
-            clang::EntityKind::TypedefDecl => TypedefKind(Typedef::from(entity)),
-            clang::EntityKind::UnionDecl => UnionKind(Union::from(entity)),
-            clang::EntityKind::VarDecl => VariableKind(Variable::from(entity)),
-            _ => return None,
-        })
-    }
-
     pub(crate) fn eq_outer(&self, other: &Self) -> bool {
         match self {
             EnumKind(..) => matches!(other, Self::EnumKind(..)),
@@ -622,9 +707,6 @@ impl Item {
         if !entity.is_declaration() {
             return Ok(None);
         }
-        if entity.is_anonymous() {
-            return Ok(None);
-        }
 
         let loc = if let Some(loc) = entity.get_location().map(|loc| loc.get_presumed_location()) {
             loc
@@ -634,7 +716,7 @@ impl Item {
 
         let abspath = std::fs::canonicalize(loc.0)?;
         if abspath.extension() != Some(std::ffi::OsStr::new("h")) {
-            // TODO: maybe we wnat to remove this to extract documentation from source files
+            // TODO: maybe we want to remove this to extract documentation from source files
             return Ok(None);
         }
 
@@ -644,11 +726,19 @@ impl Item {
 
         let kind = match entity.get_kind() {
             clang::EntityKind::EnumDecl => EnumKind(Enum::from(entity)),
-            clang::EntityKind::FunctionDecl => FunctionKind(Function::from(entity)),
-            clang::EntityKind::StructDecl => StructKind(Struct::from(entity)),
-            clang::EntityKind::TypedefDecl => TypedefKind(Typedef::from(entity)),
-            clang::EntityKind::UnionDecl => UnionKind(Union::from(entity)),
-            clang::EntityKind::VarDecl => VariableKind(Variable::from(entity)),
+            clang::EntityKind::FunctionDecl => {
+                FunctionKind(Function::from_entity(entity, compilationunit))
+            }
+            clang::EntityKind::StructDecl => {
+                StructKind(Struct::from_entity(entity, compilationunit))
+            }
+            clang::EntityKind::TypedefDecl => {
+                TypedefKind(Typedef::from_entity(entity, compilationunit))
+            }
+            clang::EntityKind::UnionDecl => UnionKind(Union::from_entity(entity, compilationunit)),
+            clang::EntityKind::VarDecl => {
+                VariableKind(Variable::from_entity(entity, compilationunit))
+            }
             clang::EntityKind::Namespace => NamespaceKind(Namespace::default()),
             _ => return Ok(None),
         };

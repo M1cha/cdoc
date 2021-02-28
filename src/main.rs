@@ -11,6 +11,7 @@ mod parsed;
 mod static_files;
 
 use item_type::ItemType;
+use itertools::Itertools;
 use rayon::prelude::*;
 use std::io::Write;
 
@@ -46,7 +47,12 @@ fn load_cdb<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<CompileCommand>, E
 fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed::Item, Error> {
     std::env::set_current_dir(&command.directory)?;
     let compilationunit = std::sync::Arc::new(std::fs::canonicalize(&command.file)?);
-    let mut outfile = tempfile::NamedTempFile::new()?;
+    let mut outfile = tempfile::Builder::new()
+        .suffix(&format!(
+            ".{}",
+            command.file.extension().unwrap().to_str().unwrap()
+        ))
+        .tempfile()?;
 
     // TODO: use argument parser which supports quoting
     let mut args: Vec<_> = command.command.split_whitespace().collect();
@@ -90,7 +96,7 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
             "-fno-builtin",
             "-nostdinc",
             "-ffreestanding",
-            "-xc",
+            //"-xc++",
         ])
         .parse()
         .unwrap();
@@ -328,6 +334,7 @@ fn write_documentation<W: std::fmt::Write>(
 }
 
 fn write_itemkind_fields<W: std::fmt::Write, N: std::fmt::Display>(
+    cx: &Context,
     f: &mut W,
     name: N,
     itemkind: &parsed::ItemKind,
@@ -343,7 +350,7 @@ fn write_itemkind_fields<W: std::fmt::Write, N: std::fmt::Display>(
                 )?;
                 write!(f, "<h3>Fields of <b>{name}</b></h3><div>", name = name)?;
 
-                write_fields(f, fields)?;
+                write_fields(cx, f, fields)?;
 
                 write!(f, "</div></div>")?;
             }
@@ -354,7 +361,60 @@ fn write_itemkind_fields<W: std::fmt::Write, N: std::fmt::Display>(
     Ok(())
 }
 
-fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std::fmt::Result {
+struct TypeFormatter<'a> {
+    cx: &'a Context,
+    ty: &'a parsed::Type,
+}
+
+impl<'a> TypeFormatter<'a> {
+    pub(crate) fn new(cx: &'a Context, ty: &'a parsed::Type) -> Self {
+        Self { cx, ty }
+    }
+}
+
+impl<'a> std::fmt::Display for TypeFormatter<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.ty.print(f, |f, itemref| {
+            for (index, (name, ty)) in itemref.path.iter().enumerate() {
+                if index > 0 {
+                    f.write_str("::")?;
+                }
+
+                write!(
+                    f,
+                    "<a{} class=\"{ty}\">{name}</a>",
+                    href = format::display_fn(|f| match ty {
+                        ItemType::Primitive => Ok(()),
+                        _ => write!(
+                            f,
+                            " href=\"{root}{path}{html}\"",
+                            root = self.cx.root_path(),
+                            path = format::ensure_trailing_slash(
+                                &itemref.path[0..index]
+                                    .iter()
+                                    .map(|(name, _)| name)
+                                    .join("/")
+                            ),
+                            html = format::display_fn(|f| match ty {
+                                ItemType::Namespace => write!(f, "{}/index.html", name),
+                                _ => write!(f, "{}.{}.html", ty, name),
+                            }),
+                        ),
+                    }),
+                    ty = ty,
+                    name = name
+                )?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn write_fields<W: std::fmt::Write>(
+    cx: &Context,
+    f: &mut W,
+    fields: &[parsed::Field],
+) -> std::fmt::Result {
     for (index, field) in fields.iter().enumerate() {
         let id = if let Some(name) = &field.name {
             format!("structfield.{}", name)
@@ -372,17 +432,10 @@ fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std:
                          <a href=\"#{id}\" class=\"anchor field\"></a>\
                          <code>{name}: {ty}</code>\
                      </span>",
-            // TODO: use correct itemtype
             item_type = ItemType::StructField,
             id = id,
             name = name,
-            ty = field.ty, /*format::display_fn(|f| match &field.ty {
-                               parsed::FieldType::String(s) => f.write_str(s),
-                               parsed::FieldType::Struct(..) =>
-                                   write!(f, "{}", escape::Escape("<<anonymous struct>>")),
-                               parsed::FieldType::Union(..) =>
-                                   write!(f, "{}", escape::Escape("<<anonymous union>>")),
-                           })*/
+            ty = TypeFormatter::new(cx, &field.ty),
         )?;
         write_documentation(f, field.comment.as_ref())?;
 
@@ -408,6 +461,7 @@ fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std:
 }
 
 fn write_fields_with_header<W: std::fmt::Write>(
+    cx: &Context,
     f: &mut W,
     fields: &[parsed::Field],
 ) -> std::fmt::Result {
@@ -416,11 +470,12 @@ fn write_fields_with_header<W: std::fmt::Write>(
         "<h2 id=\"fields\" class=\"fields small-section-header\">
                        Fields<a href=\"#fields\" class=\"anchor\"></a></h2>",
     )?;
-    write_fields(f, fields)?;
+    write_fields(cx, f, fields)?;
     Ok(())
 }
 
 fn write_struct_or_union<W: std::fmt::Write>(
+    cx: &Context,
     f: &mut W,
     item: &parsed::Item,
     fields: &[parsed::Field],
@@ -436,7 +491,7 @@ fn write_struct_or_union<W: std::fmt::Write>(
     write_documentation(f, item.comment.as_ref())?;
 
     if !fields.is_empty() {
-        write_fields_with_header(f, fields)?;
+        write_fields_with_header(cx, f, fields)?;
     }
 
     Ok(())
@@ -474,7 +529,23 @@ fn write_enum<W: std::fmt::Write>(
     item: &parsed::Item,
     e: &parsed::Enum,
 ) -> std::fmt::Result {
-    wrap_into_docblock(f, |f| write!(f, "<pre class=\"rust enum\">{};</pre>", ""))?;
+    wrap_into_docblock(f, |f| {
+        write!(
+            f,
+            "<pre class=\"rust enum\">enum {} {{\n{}}};</pre>",
+            item.name.as_ref().unwrap(),
+            format::display_fn(|f| {
+                for (index, variant) in e.variants.iter().enumerate() {
+                    write!(f, "    {}", variant.name)?;
+                    if let Some(value) = &variant.value {
+                        write!(f, " = {}", value)?;
+                    }
+                    f.write_str(",\n")?;
+                }
+                Ok(())
+            })
+        )
+    })?;
     write_documentation(f, item.comment.as_ref())?;
 
     write_enum_variants(f, &e.variants)?;
@@ -483,54 +554,69 @@ fn write_enum<W: std::fmt::Write>(
 }
 
 fn write_function<W: std::fmt::Write>(
+    cx: &Context,
     f: &mut W,
     item: &parsed::Item,
-    _func: &parsed::Function,
+    func: &parsed::Function,
 ) -> std::fmt::Result {
-    write!(f, "<pre class=\"rust fn\">{};</pre>", "")?;
+    write!(
+        f,
+        "<pre class=\"rust fn\">{} {}({});</pre>",
+        TypeFormatter::new(cx, &func.result),
+        item.name.as_ref().unwrap(),
+        format::display_fn(|f| {
+            for (index, (name, ty)) in func.arguments.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(", ")?;
+                }
+
+                write!(f, "{}: ", name)?;
+                write!(f, "{}", TypeFormatter::new(cx, ty))?;
+            }
+
+            if func.is_variadic {
+                if !func.arguments.is_empty() {
+                    f.write_str(", ")?;
+                }
+                f.write_str("...")?;
+            }
+            Ok(())
+        }),
+    )?;
     write_documentation(f, item.comment.as_ref())?;
 
     Ok(())
 }
 
 fn write_typedef<W: std::fmt::Write>(
+    cx: &Context,
     f: &mut W,
     item: &parsed::Item,
-    _typedef: &parsed::Typedef,
+    typedef: &parsed::Typedef,
 ) -> std::fmt::Result {
-    if let Some((ty, code)) = &_typedef.anonymous_ty {
-        write!(
-            f,
-            "<pre class=\"rust type\">typedef {} {};</pre>",
-            code,
-            item.name.as_ref().unwrap()
-        )?;
-        write_documentation(f, item.comment.as_ref())?;
-
-        match ty.as_ref() {
-            parsed::StructKind(parsed::Struct { fields, .. })
-            | parsed::UnionKind(parsed::Union { fields, .. }) => {
-                write_fields_with_header(f, fields)?;
-            }
-            parsed::EnumKind(e) => {
-                write_enum_variants(f, &e.variants)?;
-            }
-            _ => panic!("anonymous typedef is not implemented for: {:#?}", ty),
-        }
-    } else {
-        write!(f, "<pre class=\"rust type\">{};</pre>", "")?;
-        write_documentation(f, item.comment.as_ref())?;
-    }
+    write!(
+        f,
+        "<pre class=\"rust type\">typedef {} {};</pre>",
+        TypeFormatter::new(cx, &typedef.ty),
+        item.name.as_ref().unwrap()
+    )?;
+    write_documentation(f, item.comment.as_ref())?;
 
     Ok(())
 }
 
 fn write_variable<W: std::fmt::Write>(
+    cx: &Context,
     f: &mut W,
     item: &parsed::Item,
-    _variable: &parsed::Variable,
+    variable: &parsed::Variable,
 ) -> std::fmt::Result {
-    write!(f, "<pre class=\"rust variable\">{};</pre>", "")?;
+    write!(
+        f,
+        "<pre class=\"rust variable\">{} {};</pre>",
+        TypeFormatter::new(cx, &variable.ty),
+        item.name.as_ref().unwrap()
+    )?;
     write_documentation(f, item.comment.as_ref())?;
 
     Ok(())
@@ -723,13 +809,13 @@ fn write_page_content<W: std::fmt::Write>(
     } else {
         match &item.kind {
             parsed::EnumKind(func) => write_enum(f, item, func)?,
-            parsed::FunctionKind(func) => write_function(f, item, func)?,
+            parsed::FunctionKind(func) => write_function(cx, f, item, func)?,
             parsed::StructKind(parsed::Struct { fields, .. })
             | parsed::UnionKind(parsed::Union { fields, .. }) => {
-                write_struct_or_union(f, item, &fields)?
+                write_struct_or_union(cx, f, item, &fields)?
             }
-            parsed::TypedefKind(typedef) => write_typedef(f, item, typedef)?,
-            parsed::VariableKind(variable) => write_variable(f, item, variable)?,
+            parsed::TypedefKind(typedef) => write_typedef(cx, f, item, typedef)?,
+            parsed::VariableKind(variable) => write_variable(cx, f, item, variable)?,
             parsed::NamespaceKind(_) => write_index(cx, f, item)?,
         }
     }
