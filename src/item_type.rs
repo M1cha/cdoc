@@ -55,6 +55,27 @@ impl ItemType {
             ItemType::Class => "class",
         }
     }
+
+    pub(crate) fn to_strs(ty: &ItemType) -> (&'static str, &'static str) {
+        match *ty {
+            ItemType::Struct => ("structs", "Structs"),
+            ItemType::Union => ("unions", "Unions"),
+            ItemType::Enum => ("enums", "Enums"),
+            ItemType::Function => ("functions", "Functions"),
+            ItemType::Typedef => ("types", "Type Definitions"),
+            ItemType::Static => ("statics", "Statics"),
+            ItemType::Constant => ("constants", "Constants"),
+            ItemType::Method => ("methods", "Methods"),
+            ItemType::StructField => ("fields", "Struct Fields"),
+            ItemType::Variant => ("variants", "Variants"),
+            ItemType::Macro => ("macros", "Macros"),
+            ItemType::Primitive => ("primitives", "Primitive Types"),
+            ItemType::Keyword => ("keywords", "Keywords"),
+            ItemType::Variable => ("variables", "Variables"),
+            ItemType::Namespace => ("namespaces", "Namespaces"),
+            ItemType::Class => ("classes", "Classes"),
+        }
+    }
 }
 
 impl std::fmt::Display for ItemType {

@@ -513,23 +513,22 @@ impl ItemKind {
     fn push_deduplicate(&mut self, mut new_item: Item) -> usize {
         let items = self.items_mut().unwrap();
         for (index, item) in items.iter_mut().enumerate() {
-            if !item.kind.eq_outer(&new_item.kind) {
-                continue;
-            }
             if item.name != new_item.name {
                 continue;
             }
 
-            // check if they are the same. Depending on the implementation this
-            // add information from the new one to the old one if they were missing there.
-            if item.kind.try_update(&mut new_item.kind) {
-                // sometimes the comment is on the implementation.
-                // libclang will give us the documentation on the header item anyway
-                // so we can copy that into the public documentation
-                if item.comment.is_none() && new_item.comment.is_some() {
-                    item.comment = new_item.comment;
+            if item.kind.eq_outer(&new_item.kind) {
+                // check if they are the same. Depending on the implementation this
+                // add information from the new one to the old one if they were missing there.
+                if item.kind.try_update(&mut new_item.kind) {
+                    // sometimes the comment is on the implementation.
+                    // libclang will give us the documentation on the header item anyway
+                    // so we can copy that into the public documentation
+                    if item.comment.is_none() && new_item.comment.is_some() {
+                        item.comment = new_item.comment;
+                    }
+                    return index;
                 }
-                return index;
             }
 
             item.duplicates.push(new_item);
@@ -609,7 +608,7 @@ impl Item {
         Item {
             compilationunit: compilationunit.clone(),
             file: std::path::PathBuf::new(),
-            name: None,
+            name: Some("<<global>>".to_string()),
             comment: None,
             kind: ItemKind::NamespaceKind(Namespace::default()),
             duplicates: Vec::new(),

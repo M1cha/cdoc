@@ -11,6 +11,7 @@ mod parsed;
 mod static_files;
 
 use item_type::ItemType;
+use rayon::prelude::*;
 use std::io::Write;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,10 +46,7 @@ fn load_cdb<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<CompileCommand>, E
 fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed::Item, Error> {
     std::env::set_current_dir(&command.directory)?;
     let compilationunit = std::sync::Arc::new(std::fs::canonicalize(&command.file)?);
-    let outpath = std::path::PathBuf::from(format!(
-        "/tmp/cdoc-{}.c",
-        compilationunit.file_name().unwrap().to_str().unwrap()
-    ));
+    let mut outfile = tempfile::NamedTempFile::new()?;
 
     // TODO: use argument parser which supports quoting
     let mut args: Vec<_> = command.command.split_whitespace().collect();
@@ -68,7 +66,7 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
     args.push("-C");
 
     args.push("-o");
-    args.push(outpath.to_str().unwrap());
+    args.push(outfile.path().to_str().unwrap());
 
     //println!("ARGS: {:?}", args);
     let status = std::process::Command::new(args[0])
@@ -80,7 +78,7 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
 
     let index = clang::Index::new(&clang, false, true);
     let tu = index
-        .parser(outpath)
+        .parser(outfile.path())
         .skip_function_bodies(true)
         .arguments(&[
             // TODO: detect target
@@ -92,7 +90,7 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
             "-fno-builtin",
             "-nostdinc",
             "-ffreestanding",
-            "-xc++",
+            "-xc",
         ])
         .parse()
         .unwrap();
@@ -255,6 +253,20 @@ themePicker.onblur = handleThemeButtonsBlur;
     write(dst.join("COPYRIGHT.txt"), static_files::COPYRIGHT)?;
 
     Ok(())
+}
+
+#[derive(Default, Debug)]
+struct Context {
+    current: Vec<String>,
+    dst: std::path::PathBuf,
+}
+
+impl Context {
+    /// String representation of how to get back to the root path of the 'doc/'
+    /// folder in terms of a relative URL.
+    fn root_path(&self) -> String {
+        "../".repeat(self.current.len())
+    }
 }
 
 fn wrap_into_docblock<W: std::fmt::Write, F>(w: &mut W, f: F) -> std::fmt::Result
@@ -524,7 +536,151 @@ fn write_variable<W: std::fmt::Write>(
     Ok(())
 }
 
-fn write_page_content<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std::fmt::Result {
+/// Compare two strings treating multi-digit numbers as single units (i.e. natural sort order).
+fn compare_names(mut lhs: &str, mut rhs: &str) -> std::cmp::Ordering {
+    /// Takes a non-numeric and a numeric part from the given &str.
+    fn take_parts<'a>(s: &mut &'a str) -> (&'a str, &'a str) {
+        let i = s.find(|c: char| c.is_ascii_digit());
+        let (a, b) = s.split_at(i.unwrap_or(s.len()));
+        let i = b.find(|c: char| !c.is_ascii_digit());
+        let (b, c) = b.split_at(i.unwrap_or(b.len()));
+        *s = c;
+        (a, b)
+    }
+
+    while !lhs.is_empty() || !rhs.is_empty() {
+        let (la, lb) = take_parts(&mut lhs);
+        let (ra, rb) = take_parts(&mut rhs);
+        // First process the non-numeric part.
+        match la.cmp(ra) {
+            std::cmp::Ordering::Equal => (),
+            x => return x,
+        }
+        // Then process the numeric part, if both sides have one (and they fit in a u64).
+        if let (Ok(ln), Ok(rn)) = (lb.parse::<u64>(), rb.parse::<u64>()) {
+            match ln.cmp(&rn) {
+                std::cmp::Ordering::Equal => (),
+                x => return x,
+            }
+        }
+        // Then process the numeric part again, but this time as strings.
+        match lb.cmp(rb) {
+            std::cmp::Ordering::Equal => (),
+            x => return x,
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn item_path(ty: ItemType, name: &str) -> String {
+    match ty {
+        ItemType::Namespace => format!("{}index.html", format::ensure_trailing_slash(name)),
+        _ => format!("{}.{}.html", ty, name),
+    }
+}
+
+fn full_path(cx: &Context, item: &parsed::Item) -> String {
+    let mut s = cx.current.join("::");
+    if !cx.current.is_empty() {
+        s.push_str("::");
+    }
+    s.push_str(&item.name.as_ref().unwrap().as_str());
+    s
+}
+
+fn write_index<W: std::fmt::Write>(
+    cx: &Context,
+    f: &mut W,
+    item: &parsed::Item,
+) -> std::fmt::Result {
+    write_documentation(f, item.comment.as_ref())?;
+
+    let items = item.items().unwrap();
+    let mut indices = (0..items.len()).collect::<Vec<usize>>();
+
+    // the order of item types in the listing
+    fn reorder(ty: ItemType) -> u8 {
+        match ty {
+            ItemType::Primitive => 2,
+            ItemType::Namespace => 3,
+            ItemType::Macro => 4,
+            ItemType::Struct => 5,
+            ItemType::Enum => 6,
+            ItemType::Constant => 7,
+            ItemType::Static => 8,
+            ItemType::Function => 10,
+            ItemType::Typedef => 12,
+            ItemType::Union => 13,
+            _ => 14 + ty as u8,
+        }
+    }
+
+    fn cmp(i1: &parsed::Item, i2: &parsed::Item, idx1: usize, idx2: usize) -> std::cmp::Ordering {
+        let ty1 = i1.type_();
+        let ty2 = i2.type_();
+        if ty1 != ty2 {
+            return (reorder(ty1), idx1).cmp(&(reorder(ty2), idx2));
+        }
+        let lhs = i1.name.as_ref().unwrap().as_str();
+        let rhs = i2.name.as_ref().unwrap().as_str();
+        compare_names(&lhs, &rhs)
+    }
+
+    indices.sort_by(|&i1, &i2| cmp(&items[i1], &items[i2], i1, i2));
+
+    let mut curty = None;
+    for &idx in &indices {
+        let myitem = &items[idx];
+        let myty = Some(myitem.type_());
+        if myty != curty {
+            if curty.is_some() {
+                write!(f, "</table>")?;
+            }
+            curty = myty;
+            let (short, name) = ItemType::to_strs(&myty.unwrap());
+            write!(
+                f,
+                "<h2 id=\"{id}\" class=\"section-header\">\
+                       <a href=\"#{id}\">{name}</a></h2>\n<table>",
+                id = short.to_owned(),
+                name = name
+            )?;
+        }
+
+        let doc_value = myitem.comment.as_ref().map(|c| c.as_str()).unwrap_or("");
+        write!(
+            f,
+            "<tr class=\"module-item\">\
+                         <td><a class=\"{class}\" href=\"{href}\" \
+                             title=\"{title}\">{name}</a></td>\
+                         <td class=\"docblock-short\">{docs}</td>\
+                     </tr>",
+            name = *myitem.name.as_ref().unwrap(),
+            docs = "summary",
+            class = myitem.type_(),
+            href = item_path(myitem.type_(), &myitem.name.as_ref().unwrap().as_str()),
+            title = [full_path(cx, myitem), myitem.type_().to_string()]
+                .iter()
+                .filter_map(|s| if !s.is_empty() {
+                    Some(s.as_str())
+                } else {
+                    None
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_page_content<W: std::fmt::Write>(
+    cx: &Context,
+    f: &mut W,
+    item: &parsed::Item,
+    index: bool,
+) -> std::fmt::Result {
     write!(f, "<h1 class=\"fqn\"><span class=\"out-of-band\">")?;
 
     write!(
@@ -549,7 +705,6 @@ fn write_page_content<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std
         parsed::TypedefKind(..) => "Type Definition ",
         parsed::UnionKind(..) => "Union ",
         parsed::VariableKind(..) => "Variable ",
-        // TODO: does this make sense here?
         parsed::NamespaceKind(..) => "Namespace ",
     };
     f.write_str(name)?;
@@ -558,37 +713,40 @@ fn write_page_content<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std
         f,
         "<a class=\"{}\" href=\"\">{}</a>",
         item.type_(),
-        item.name.as_ref().unwrap()
+        escape::Escape(item.name.as_ref().unwrap())
     )?;
 
     write!(f, "</span></h1>")?; // in-band
 
-    if item.name.as_ref() == Some(&"k_thread_resume".to_string()) {
-        println!("{:#?}", item);
-    }
-
-    match &item.kind {
-        parsed::EnumKind(func) => write_enum(f, item, func)?,
-        parsed::FunctionKind(func) => write_function(f, item, func)?,
-        parsed::StructKind(parsed::Struct { fields, .. })
-        | parsed::UnionKind(parsed::Union { fields, .. }) => {
-            write_struct_or_union(f, item, &fields)?
+    if index {
+        write_index(cx, f, item)?;
+    } else {
+        match &item.kind {
+            parsed::EnumKind(func) => write_enum(f, item, func)?,
+            parsed::FunctionKind(func) => write_function(f, item, func)?,
+            parsed::StructKind(parsed::Struct { fields, .. })
+            | parsed::UnionKind(parsed::Union { fields, .. }) => {
+                write_struct_or_union(f, item, &fields)?
+            }
+            parsed::TypedefKind(typedef) => write_typedef(f, item, typedef)?,
+            parsed::VariableKind(variable) => write_variable(f, item, variable)?,
+            parsed::NamespaceKind(_) => write_index(cx, f, item)?,
         }
-        parsed::TypedefKind(typedef) => write_typedef(f, item, typedef)?,
-        parsed::VariableKind(variable) => write_variable(f, item, variable)?,
-        // TODO: does this make sense here?
-        parsed::NamespaceKind(..) => (),
     }
 
     Ok(())
 }
 
-fn write_sidebar<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std::fmt::Result {
+fn write_sidebar<W: std::fmt::Write>(
+    _ctx: &Context,
+    f: &mut W,
+    item: &parsed::Item,
+) -> std::fmt::Result {
     write!(
         f,
         "<p class=\"location\">{}{}</p>",
         "Struct ",
-        item.name.as_ref().unwrap()
+        escape::Escape(item.name.as_ref().unwrap())
     )?;
 
     write!(f, "<div class=\"sidebar-elems\">")?;
@@ -625,26 +783,28 @@ fn write_sidebar<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std::fmt
     Ok(())
 }
 
-fn write_item<P: AsRef<std::path::Path>>(dst: P, item: &parsed::Item) -> Result<(), Error> {
-    let dst = dst.as_ref();
-    let f = open_file(dst.join(format!(
-        "{}.{}.html",
-        item.type_(),
-        item.name.as_ref().unwrap()
-    )))?;
+fn write_item(cx: &Context, item: &parsed::Item, index: bool) -> Result<(), Error> {
+    let ty = item.type_();
+    let path = if index {
+        cx.dst.join("index.html")
+    } else {
+        cx.dst
+            .join(format!("{}.{}.html", ty, item.name.as_ref().unwrap()))
+    };
+    let f = open_file(path)?;
 
     let tyname = item.type_();
     let layout = layout::Layout {
         logo: String::new(),
         favicon: String::new(),
         default_settings: std::collections::HashMap::new(),
-        krate: "crate name".to_string(),
+        krate: "".to_string(),
         css_file_extension: None,
         generate_search_filter: false,
     };
     let page = layout::Page {
         css_class: tyname.as_str(),
-        root_path: "",
+        root_path: &cx.root_path(),
         static_root_path: None,
         title: item.name.as_ref().unwrap(),
         description: "",
@@ -657,13 +817,38 @@ fn write_item<P: AsRef<std::path::Path>>(dst: P, item: &parsed::Item) -> Result<
         format::IoWriteFormatter::new(f),
         &layout,
         &page,
-        format::display_fn(|f| write_sidebar(f, item)),
-        format::display_fn(|f| write_page_content(f, item)),
+        format::display_fn(|f| write_sidebar(cx, f, item)),
+        format::display_fn(|f| write_page_content(cx, f, item, index)),
         &[layout::StylePath {
-            path: dst.join("light.css"),
+            path: cx.dst.join("light.css"),
             disabled: false,
         }],
     )?;
+
+    Ok(())
+}
+
+fn write_items(cx: &mut Context, container: &parsed::Item) -> Result<(), Error> {
+    let items = container.items().unwrap();
+
+    write_item(&cx, container, true)?;
+
+    for item in items {
+        if !matches!(item.kind, parsed::ItemKind::NamespaceKind(..)) {
+            write_item(&cx, item, false)?;
+        }
+
+        if item.items().map(|items| !items.is_empty()).unwrap_or(false) {
+            let name = item.name.clone().unwrap();
+            cx.current.push(name.clone());
+            cx.dst.push(name);
+
+            write_items(cx, item)?;
+
+            cx.dst.pop();
+            cx.current.pop();
+        }
+    }
 
     Ok(())
 }
@@ -706,18 +891,21 @@ fn main() -> Result<(), Error> {
     let mut root = parsed::Item::root(&std::sync::Arc::new(std::path::PathBuf::new()));
 
     let cwd = std::env::current_dir()?;
-    for command in &cdb {
-        // skip unsupported files
-        match command.file.extension().map(|o| o.to_str()).unwrap_or(None) {
-            Some("c") | Some("h") => (),
-            _ => continue,
-        }
-
-        let new_root = process_file(command, &clang)?;
-        root.extend(new_root);
+    let mut results: Vec<_> = cdb
+        .par_iter()
+        .filter_map(|command| {
+            // skip unsupported files
+            match command.file.extension().map(|o| o.to_str()).unwrap_or(None) {
+                Some("c") | Some("h") => Some(process_file(command, &clang).unwrap()),
+                _ => None,
+            }
+        })
+        .collect();
+    for result in results.drain(..) {
+        root.extend(result);
     }
     std::env::set_current_dir(&cwd)?;
-    println!("{:#?}", root);
+    //println!("{:#?}", root);
 
     copy_statics(&dst)?;
 
@@ -735,9 +923,9 @@ fn main() -> Result<(), Error> {
     );
     write(dst.join("sidebar-items.js"), v.as_bytes())?;
 
-    for item in root.items().unwrap() {
-        write_item(&dst, item)?;
-    }
+    let mut cx = Context::default();
+    cx.dst = dst;
+    write_items(&mut cx, &root)?;
 
     Ok(())
 }
