@@ -1,5 +1,8 @@
 pub(crate) use self::ItemKind::*;
 
+use std::convert::TryInto;
+use std::io::BufRead;
+
 macro_rules! unwrap_enum {
     ($expression:expr, $ident:ident) => {
         match $expression {
@@ -9,11 +12,132 @@ macro_rules! unwrap_enum {
     };
 }
 
+fn get_comment(entity: &clang::Entity<'_>) -> Result<Option<String>, crate::Error> {
+    let mut comment = entity.get_comment();
+    if comment.is_some() {
+        let entity_loc = entity.get_location().unwrap().get_presumed_location();
+        let comment_range = entity.get_comment_range().unwrap();
+        let comment_loc = comment_range.get_end().get_presumed_location();
+
+        if entity_loc.0 != comment_loc.0 {
+            //eprintln!("comment is in a different file than the declaration");
+            comment = None;
+        } else if entity_loc.1 < comment_loc.1 {
+            //eprintln!("comment comes after declaration");
+            comment = None;
+        } else {
+            let f = std::fs::File::open(comment_loc.0)?;
+            let reader = std::io::BufReader::new(f);
+            let line_from: usize = comment_loc.1.try_into()?;
+            let line_to: usize = entity_loc.1.try_into()?;
+
+            for (_, line) in reader
+                .lines()
+                .enumerate()
+                .skip(line_from)
+                .take_while(|(i, _)| *i < line_to - 1)
+            {
+                let line = line.as_ref().unwrap().trim();
+                if line.starts_with('#') {
+                    let name = line[1..].trim();
+                    if name.starts_with("define") {
+                        //eprintln!("there's a define between the comment and the declaration");
+                        comment = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(comment)
+}
+
+pub(crate) struct ItemRef {
+    path: Vec<(String, crate::ItemType)>,
+}
+
+impl From<&clang::Entity<'_>> for ItemRef {
+    fn from(entity: &clang::Entity<'_>) -> Self {
+        let mut path = Vec::new();
+
+        let mut current = entity.clone();
+        loop {
+            let kind = current.get_kind();
+            match kind {
+                clang::EntityKind::TranslationUnit => break,
+                _ => {
+                    let itemtype = match kind {
+                        clang::EntityKind::StructDecl => crate::ItemType::Struct,
+                        clang::EntityKind::UnionDecl => crate::ItemType::Union,
+                        clang::EntityKind::ClassDecl => crate::ItemType::Class,
+                        clang::EntityKind::Namespace => crate::ItemType::Namespace,
+                        _ => unimplemented!(),
+                    };
+
+                    path.push((current.get_name().unwrap(), itemtype));
+                    current = current.get_semantic_parent().unwrap();
+                }
+            }
+        }
+        path.reverse();
+
+        Self { path }
+    }
+}
+
+struct Context {
+    pub(crate) compilationunit: std::sync::Arc<std::path::PathBuf>,
+    pub(crate) root: Item,
+}
+
+impl Context {
+    fn parse_children(&mut self, parent_entity: &clang::Entity<'_>) {
+        for entity in parent_entity.get_children() {
+            // apparently is_anonymous can return false for nameless typedef
+            // structs.
+            if entity.get_name().is_none() {
+                continue;
+            }
+
+            if let Some(item) = Item::from_entity(&entity, &self.compilationunit).unwrap() {
+                let is_container = item.is_container();
+                self.root.kind.push_to_semantic_parent(item, &entity);
+                if is_container {
+                    self.parse_children(&entity);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn parse_tu(
+    tu: &clang::Entity<'_>,
+    compilationunit: &std::sync::Arc<std::path::PathBuf>,
+) -> Item {
+    let mut ctx = Context {
+        compilationunit: compilationunit.clone(),
+        root: Item::root(compilationunit),
+    };
+
+    ctx.parse_children(tu);
+
+    ctx.root
+}
+
 #[enum_dispatch::enum_dispatch]
 trait ItemKindFns {
     /// if the other itemkind is similar enough, extend this item with it's data and return true
     /// Otherwise, return false
-    fn try_update(&mut self, other: &ItemKind) -> bool;
+    fn try_update(&mut self, other: &mut ItemKind) -> bool;
+
+    fn items(&self) -> Option<&[Item]> {
+        None
+    }
+
+    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+        None
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -36,7 +160,7 @@ impl From<&clang::Entity<'_>> for Enum {
                 .filter(|entity| entity.get_kind() == clang::EntityKind::EnumConstantDecl)
                 .map(|entity| EnumVariant {
                     name: entity.get_display_name().unwrap(),
-                    comment: entity.get_comment(),
+                    comment: get_comment(entity).unwrap(),
                 })
                 .collect(),
         }
@@ -44,7 +168,7 @@ impl From<&clang::Entity<'_>> for Enum {
 }
 
 impl ItemKindFns for Enum {
-    fn try_update(&mut self, other: &ItemKind) -> bool {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, EnumKind);
 
         self.variants == other.variants
@@ -65,7 +189,7 @@ impl From<&clang::Entity<'_>> for Function {
 }
 
 impl ItemKindFns for Function {
-    fn try_update(&mut self, other: &ItemKind) -> bool {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, FunctionKind);
 
         if self.ty != other.ty {
@@ -163,135 +287,30 @@ impl std::fmt::Display for TypeKind {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct FieldDeclaration {
-    pub(crate) name: String,
-    pub(crate) comment: Option<String>,
-    pub(crate) kind: ItemKind,
-}
-
-#[derive(Debug, PartialEq)]
 pub(crate) struct Field {
     pub(crate) name: Option<String>,
+    //pub(crate) ty: Type,
+    pub(crate) ty: String,
     pub(crate) comment: Option<String>,
-    pub(crate) declarations: Vec<FieldDeclaration>,
-    pub(crate) ty: Type,
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Struct {
     pub(crate) fields: Vec<Field>,
+    pub(crate) items: Vec<Item>,
 }
 
 fn get_fields(container_entity: &clang::Entity<'_>) -> Vec<Field> {
-    /// we do want to include anonymous entities if they're not part of a named field
-    fn is_entity_from_fielddecl(
-        container_entity: &clang::Entity<'_>,
-        entity: &clang::Entity<'_>,
-    ) -> bool {
-        container_entity
-            .get_children()
-            .iter()
-            .filter(|e| e.get_kind() == clang::EntityKind::FieldDecl)
-            .filter(|e| {
-                e.get_children()
-                    .iter()
-                    .filter(|e| *e == entity)
-                    .next()
-                    .is_some()
-            })
-            .next()
-            .is_some()
-    }
+    let ty = container_entity.get_type().unwrap();
+    let fields = ty.get_fields().unwrap();
 
-    container_entity
-        .get_children()
+    fields
         .iter()
-        .filter_map(|entity| match entity.get_kind() {
-            clang::EntityKind::FieldDecl => Some(Field {
-                name: entity.get_display_name(),
-                comment: entity.get_comment(),
-                declarations: entity
-                    .get_children()
-                    .iter()
-                    .filter(|child| child.is_declaration() && !child.is_anonymous())
-                    .map(|child| FieldDeclaration {
-                        name: child.get_name().unwrap(),
-                        comment: child.get_comment(),
-                        kind: ItemKind::from_entity(child).unwrap(),
-                    })
-                    .collect(),
-                ty: Type::from(&entity.get_type().unwrap()), /*{
-                                                                 let ty = entity.get_type().unwrap();
-                                                                 let tydecl = ty.get_declaration();
-                                                                 let children = entity.get_children();
-
-                                                                 println!(
-                                                                     "name={:?} ty={:?} decl:{:?} anon={:?}",
-                                                                     entity.get_display_name(),
-                                                                     ty,
-                                                                     tydecl,
-                                                                     tydecl.map(|d| d.is_anonymous())
-                                                                 );
-
-                                                                 Type {
-                                                                     kind: TypeKind::Primitive(ty.get_display_name()),
-                                                                 }
-
-                                                                 /*let mut kind = None;
-                                                                 for child in &children {
-                                                                     let newkind = if child.is_declaration() {
-                                                                         ItemKind::from_entity(child)
-                                                                     } else {
-                                                                         match child.get_kind() {
-                                                                             //clang::TypeKind
-                                                                             _ => None,
-                                                                         }
-                                                                         //_ => FieldType::String(entity.get_type().unwrap().get_display_name()),
-                                                                     };
-
-                                                                     if newkind.is_some() {
-                                                                         if kind.is_some() {
-                                                                             panic!("a field can't have multiple type kinds");
-                                                                         }
-                                                                         kind = newkind;
-                                                                     }
-                                                                 }
-
-                                                                 if let Some(kind) = kind {
-                                                                     Type {
-                                                                         kind: TypeKind::Anonymous(kind),
-                                                                     }
-                                                                 } else {
-                                                                     panic!("unsupported type: {:#?}", entity);
-                                                                 }*/
-                                                             },*/
-            }),
-            _ => {
-                if entity.is_declaration() {
-                    if is_entity_from_fielddecl(container_entity, entity) {
-                        None
-                    } else {
-                        Some(Field {
-                            name: None,
-                            comment: entity.get_comment(),
-                            declarations: Vec::new(),
-                            ty: Type {
-                                kind: TypeKind::Anonymous(
-                                    if let Some(itemkind) = ItemKind::from_entity(entity) {
-                                        itemkind
-                                    } else {
-                                        panic!("unsupported anonymous type: {:#?}", entity);
-                                    },
-                                ),
-                            },
-                        })
-                    }
-                } else if entity.is_attribute() {
-                    None
-                } else {
-                    unimplemented!("NONFIELD: {:#?}", entity)
-                }
-            }
+        .map(|entity| Field {
+            name: entity.get_display_name(),
+            //ty: Type::from(&entity.get_type().unwrap()),
+            ty: entity.get_type().unwrap().get_display_name(),
+            comment: entity.get_comment(),
         })
         .collect()
 }
@@ -300,14 +319,23 @@ impl From<&clang::Entity<'_>> for Struct {
     fn from(entity: &clang::Entity<'_>) -> Self {
         Self {
             fields: get_fields(entity),
+            items: Vec::new(),
         }
     }
 }
 
 impl ItemKindFns for Struct {
-    fn try_update(&mut self, other: &ItemKind) -> bool {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, StructKind);
         self.fields == other.fields
+    }
+
+    fn items(&self) -> Option<&[Item]> {
+        Some(&self.items)
+    }
+
+    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+        Some(&mut self.items)
     }
 }
 
@@ -340,7 +368,7 @@ impl From<&clang::Entity<'_>> for Typedef {
 }
 
 impl ItemKindFns for Typedef {
-    fn try_update(&mut self, other: &ItemKind) -> bool {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, TypedefKind);
         self.ty == other.ty
     }
@@ -349,20 +377,30 @@ impl ItemKindFns for Typedef {
 #[derive(Debug, PartialEq)]
 pub(crate) struct Union {
     pub(crate) fields: Vec<Field>,
+    pub(crate) items: Vec<Item>,
 }
 
 impl From<&clang::Entity<'_>> for Union {
     fn from(entity: &clang::Entity<'_>) -> Self {
         Self {
             fields: get_fields(entity),
+            items: Vec::new(),
         }
     }
 }
 
 impl ItemKindFns for Union {
-    fn try_update(&mut self, other: &ItemKind) -> bool {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, UnionKind);
         self.fields == other.fields
+    }
+
+    fn items(&self) -> Option<&[Item]> {
+        Some(&self.items)
+    }
+
+    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+        Some(&mut self.items)
     }
 }
 
@@ -374,7 +412,6 @@ pub(crate) struct Variable {
 impl From<&clang::Entity<'_>> for Variable {
     fn from(entity: &clang::Entity<'_>) -> Self {
         {
-            println!("{:?}", entity.get_type());
             Self {
                 ty: entity.get_type().unwrap().get_display_name(),
             }
@@ -383,9 +420,32 @@ impl From<&clang::Entity<'_>> for Variable {
 }
 
 impl ItemKindFns for Variable {
-    fn try_update(&mut self, other: &ItemKind) -> bool {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
         let other = unwrap_enum!(other, VariableKind);
         self.ty == other.ty
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Namespace {
+    items: Vec<Item>,
+}
+
+impl ItemKindFns for Namespace {
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
+        let other = unwrap_enum!(other, NamespaceKind);
+        for item in other.items.drain(..) {
+            self.items.push(item);
+        }
+        true
+    }
+
+    fn items(&self) -> Option<&[Item]> {
+        Some(&self.items)
+    }
+
+    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+        Some(&mut self.items)
     }
 }
 
@@ -398,6 +458,7 @@ pub(crate) enum ItemKind {
     TypedefKind(Typedef),
     UnionKind(Union),
     VariableKind(Variable),
+    NamespaceKind(Namespace),
 }
 
 impl ItemKind {
@@ -421,6 +482,19 @@ impl ItemKind {
             TypedefKind(..) => matches!(other, Self::TypedefKind(..)),
             UnionKind(..) => matches!(other, Self::UnionKind(..)),
             VariableKind(..) => matches!(other, Self::VariableKind(..)),
+            NamespaceKind(..) => matches!(other, Self::NamespaceKind(..)),
+        }
+    }
+
+    pub(crate) fn eq_clangkind(&self, other: &clang::EntityKind) -> bool {
+        match self {
+            EnumKind(..) => matches!(other, clang::EntityKind::EnumDecl),
+            FunctionKind(..) => matches!(other, clang::EntityKind::FunctionDecl),
+            StructKind(..) => matches!(other, clang::EntityKind::StructDecl),
+            TypedefKind(..) => matches!(other, clang::EntityKind::TypedefDecl),
+            UnionKind(..) => matches!(other, clang::EntityKind::UnionDecl),
+            VariableKind(..) => matches!(other, clang::EntityKind::VarDecl),
+            NamespaceKind(..) => matches!(other, clang::EntityKind::Namespace),
         }
     }
 
@@ -431,6 +505,89 @@ impl ItemKind {
             EnumKind(..) => Some("enum"),
             _ => None,
         }
+    }
+
+    /// pushes a new item to the kind if it supports children
+    /// if it exists, either merge them or push it as a duplicate.
+    /// returns the index of the new item or existing item ignoring duplicates
+    fn push_deduplicate(&mut self, mut new_item: Item) -> usize {
+        let items = self.items_mut().unwrap();
+        for (index, item) in items.iter_mut().enumerate() {
+            if !item.kind.eq_outer(&new_item.kind) {
+                continue;
+            }
+            if item.name != new_item.name {
+                continue;
+            }
+
+            // check if they are the same. Depending on the implementation this
+            // add information from the new one to the old one if they were missing there.
+            if item.kind.try_update(&mut new_item.kind) {
+                // sometimes the comment is on the implementation.
+                // libclang will give us the documentation on the header item anyway
+                // so we can copy that into the public documentation
+                if item.comment.is_none() && new_item.comment.is_some() {
+                    item.comment = new_item.comment;
+                }
+                return index;
+            }
+
+            item.duplicates.push(new_item);
+            return index;
+        }
+
+        items.push(new_item);
+        items.len() - 1
+    }
+
+    /// push the new item to the given relative path
+    fn push_to_path(&mut self, new_item: Item, path: &[(String, clang::Entity<'_>)]) {
+        if let Some((name, entity)) = path.first() {
+            if let Some(item) =
+                self.items_mut().unwrap().iter_mut().find(|e| {
+                    e.kind.eq_clangkind(&entity.get_kind()) && e.name.as_ref() == Some(name)
+                })
+            {
+                item.kind.push_to_path(new_item, &path[1..]);
+            } else {
+                let index = self.push_deduplicate(
+                    Item::from_entity(entity, &new_item.compilationunit)
+                        .unwrap()
+                        .unwrap(),
+                );
+
+                self.items_mut().unwrap()[index]
+                    .kind
+                    .push_to_path(new_item, &path[1..]);
+            }
+        } else {
+            self.push_deduplicate(new_item);
+        }
+    }
+
+    /// under the assumption that this itemkind dis the root namespace,
+    /// push it to the semantic path creating missing parents along the way
+    pub(crate) fn push_to_semantic_parent(
+        &mut self,
+        new_item: Item,
+        new_entity: &clang::Entity<'_>,
+    ) {
+        let mut path = Vec::new();
+        {
+            let mut current = new_entity.get_semantic_parent().unwrap();
+            loop {
+                let kind = current.get_kind();
+                match kind {
+                    clang::EntityKind::TranslationUnit => break,
+                    _ => {
+                        path.push((current.get_name().unwrap(), current.clone()));
+                        current = current.get_semantic_parent().unwrap();
+                    }
+                }
+            }
+            path.reverse();
+        }
+        self.push_to_path(new_item, &path);
     }
 }
 
@@ -443,48 +600,85 @@ pub(crate) struct Item {
     pub(crate) name: Option<String>,
     pub(crate) comment: Option<String>,
     pub(crate) kind: ItemKind,
-    pub(crate) code: String,
 
     pub(crate) duplicates: Vec<Item>,
 }
 
 impl Item {
+    pub(crate) fn root(compilationunit: &std::sync::Arc<std::path::PathBuf>) -> Item {
+        Item {
+            compilationunit: compilationunit.clone(),
+            file: std::path::PathBuf::new(),
+            name: None,
+            comment: None,
+            kind: ItemKind::NamespaceKind(Namespace::default()),
+            duplicates: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_entity(
+        entity: &clang::Entity<'_>,
+        compilationunit: &std::sync::Arc<std::path::PathBuf>,
+    ) -> Result<Option<Self>, crate::Error> {
+        if !entity.is_declaration() {
+            return Ok(None);
+        }
+        if entity.is_anonymous() {
+            return Ok(None);
+        }
+
+        let loc = if let Some(loc) = entity.get_location().map(|loc| loc.get_presumed_location()) {
+            loc
+        } else {
+            return Ok(None);
+        };
+
+        let abspath = std::fs::canonicalize(loc.0)?;
+        if abspath.extension() != Some(std::ffi::OsStr::new("h")) {
+            // TODO: maybe we wnat to remove this to extract documentation from source files
+            return Ok(None);
+        }
+
+        if entity != &entity.get_canonical_entity() {
+            return Ok(None);
+        }
+
+        let kind = match entity.get_kind() {
+            clang::EntityKind::EnumDecl => EnumKind(Enum::from(entity)),
+            clang::EntityKind::FunctionDecl => FunctionKind(Function::from(entity)),
+            clang::EntityKind::StructDecl => StructKind(Struct::from(entity)),
+            clang::EntityKind::TypedefDecl => TypedefKind(Typedef::from(entity)),
+            clang::EntityKind::UnionDecl => UnionKind(Union::from(entity)),
+            clang::EntityKind::VarDecl => VariableKind(Variable::from(entity)),
+            clang::EntityKind::Namespace => NamespaceKind(Namespace::default()),
+            _ => return Ok(None),
+        };
+
+        Ok(Some(Item {
+            compilationunit: compilationunit.clone(),
+            file: abspath,
+            name: entity.get_name(),
+            comment: get_comment(entity)?,
+            kind,
+            duplicates: Vec::new(),
+        }))
+    }
+
     pub(crate) fn type_(&self) -> crate::item_type::ItemType {
         (&self.kind).into()
     }
-}
 
-#[derive(Default, Debug)]
-pub(crate) struct ItemList {
-    pub(crate) items: Vec<Item>,
-}
+    pub(crate) fn items(&self) -> Option<&[Item]> {
+        self.kind.items()
+    }
 
-impl ItemList {
-    pub(crate) fn push(&mut self, new_item: Item) {
-        for item in &mut self.items {
-            if !item.kind.eq_outer(&new_item.kind) {
-                continue;
-            }
-            if item.name != new_item.name {
-                continue;
-            }
-
-            // check if they are the same. Depending on the implementation this
-            // add information from the new one to the old one if they were missing there.
-            if item.kind.try_update(&new_item.kind) {
-                // sometimes the comment is on the implementation.
-                // libclang will give us the documentation on the header item anyway
-                // so we can copy that into the public documentation
-                if item.comment.is_none() && new_item.comment.is_some() {
-                    item.comment = new_item.comment;
-                }
-                return;
-            }
-
-            item.duplicates.push(new_item);
-            return;
+    pub(crate) fn extend(&mut self, mut other: Item) {
+        for item in other.kind.items_mut().unwrap().drain(..) {
+            self.kind.push_deduplicate(item);
         }
+    }
 
-        self.items.push(new_item);
+    pub(crate) fn is_container(&self) -> bool {
+        self.items().is_some()
     }
 }

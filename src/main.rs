@@ -1,10 +1,7 @@
 // TODO: the same function might be declared twice - one inline and one normally.
 //       ignore the non-inline one.
 // TODO: function forward declarations might have additional attributes, merge
-// TODO: we scan skip nameless types, but for enums they would be useful since they're still usable
-//       due to anonymous typedef which show up as an antity we need a way to find out if we added
-//       such an item as part of a typedef already.
-// TODO: unnamed union fields (__esf)
+// TODO: consider TypeRefs
 
 mod escape;
 mod format;
@@ -14,8 +11,6 @@ mod parsed;
 mod static_files;
 
 use item_type::ItemType;
-use std::convert::TryInto;
-use std::io::BufRead;
 use std::io::Write;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,18 +42,9 @@ fn load_cdb<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<CompileCommand>, E
     Ok(cdb)
 }
 
-fn process_file(
-    command: &CompileCommand,
-    clang: &clang::Clang,
-    items: &mut parsed::ItemList,
-) -> Result<(), Error> {
-    if command.file.extension() != Some(std::ffi::OsStr::new("c")) {
-        return Ok(());
-    }
-
+fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed::Item, Error> {
     std::env::set_current_dir(&command.directory)?;
     let compilationunit = std::sync::Arc::new(std::fs::canonicalize(&command.file)?);
-    //let outpath = std::path::Path::new("/tmp/cdoc.c");
     let outpath = std::path::PathBuf::from(format!(
         "/tmp/cdoc-{}.c",
         compilationunit.file_name().unwrap().to_str().unwrap()
@@ -95,6 +81,7 @@ fn process_file(
     let index = clang::Index::new(&clang, false, true);
     let tu = index
         .parser(outpath)
+        .skip_function_bodies(true)
         .arguments(&[
             // TODO: detect target
             "-target",
@@ -105,112 +92,14 @@ fn process_file(
             "-fno-builtin",
             "-nostdinc",
             "-ffreestanding",
+            "-xc++",
         ])
         .parse()
         .unwrap();
-    for entity in tu.get_entity().get_children() {
-        if entity.get_name().is_none() {
-            continue;
-        }
 
-        let loc = if let Some(loc) = entity.get_location().map(|loc| loc.get_presumed_location()) {
-            loc
-        } else {
-            continue;
-        };
+    let root = parsed::parse_tu(&tu.get_entity(), &compilationunit);
 
-        let abspath = std::fs::canonicalize(loc.0)?;
-        if abspath.extension() != Some(std::ffi::OsStr::new("h")) {
-            continue;
-        }
-
-        // untested better version:
-        if entity != entity.get_canonical_entity() {
-            continue;
-        }
-        /*if !entity.is_definition() {
-            match entity.get_kind() {
-                clang::EntityKind::FunctionDecl => (),
-                clang::EntityKind::VarDecl => (),
-                // this is a forward decl from e.g. a struct
-                // this wouldn't give us enough information to build documentation.
-                _ => continue,
-            }
-        }*/
-
-        /*println!(
-            "{:#?}",
-            entity
-                .get_children()
-                .iter()
-                .map(|c| c.get_type())
-                .collect::<Vec<_>>()
-        );*/
-        let kind = match parsed::ItemKind::from_entity(&entity) {
-            Some(v) => v,
-            _ => continue,
-        };
-        let mut code = entity.get_pretty_printer().print();
-        if matches!(entity.get_kind(), clang::EntityKind::FunctionDecl) {
-            code = code.split("{").collect::<Vec<_>>()[0].trim().to_string();
-        }
-
-        if
-        /*compilationunit.ends_with("fdtable.c")
-        &&*/
-        entity.get_name().as_ref() == Some(&"I2S_RXD_Type".to_string()) {
-            //println!("{:#?}", entity);
-        }
-
-        let mut comment = entity.get_comment();
-        if comment.is_some() {
-            let entity_loc = entity.get_location().unwrap().get_presumed_location();
-            let comment_range = entity.get_comment_range().unwrap();
-            let comment_loc = comment_range.get_end().get_presumed_location();
-
-            if entity_loc.0 != comment_loc.0 {
-                //eprintln!("comment is in a different file than the declaration");
-                comment = None;
-            } else if entity_loc.1 < comment_loc.1 {
-                //eprintln!("comment comes after declaration");
-                comment = None;
-            } else {
-                let f = std::fs::File::open(comment_loc.0)?;
-                let reader = std::io::BufReader::new(f);
-                let line_from: usize = comment_loc.1.try_into()?;
-                let line_to: usize = entity_loc.1.try_into()?;
-
-                for (_, line) in reader
-                    .lines()
-                    .enumerate()
-                    .skip(line_from)
-                    .take_while(|(i, _)| *i < line_to - 1)
-                {
-                    let line = line.as_ref().unwrap().trim();
-                    if line.starts_with('#') {
-                        let name = line[1..].trim();
-                        if name.starts_with("define") {
-                            //eprintln!("there's a define between the comment and the declaration");
-                            comment = None;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        items.push(parsed::Item {
-            compilationunit: compilationunit.clone(),
-            file: abspath,
-            name: entity.get_name(),
-            comment,
-            kind,
-            code,
-            duplicates: Vec::new(),
-        });
-    }
-
-    Ok(())
+    Ok(root)
 }
 
 fn open_file<P: AsRef<std::path::Path>>(dst: P) -> Result<std::fs::File, Error> {
@@ -475,17 +364,17 @@ fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std:
             item_type = ItemType::StructField,
             id = id,
             name = name,
-            ty = field.ty.kind, /*format::display_fn(|f| match &field.ty {
-                                    parsed::FieldType::String(s) => f.write_str(s),
-                                    parsed::FieldType::Struct(..) =>
-                                        write!(f, "{}", escape::Escape("<<anonymous struct>>")),
-                                    parsed::FieldType::Union(..) =>
-                                        write!(f, "{}", escape::Escape("<<anonymous union>>")),
-                                })*/
+            ty = field.ty, /*format::display_fn(|f| match &field.ty {
+                               parsed::FieldType::String(s) => f.write_str(s),
+                               parsed::FieldType::Struct(..) =>
+                                   write!(f, "{}", escape::Escape("<<anonymous struct>>")),
+                               parsed::FieldType::Union(..) =>
+                                   write!(f, "{}", escape::Escape("<<anonymous union>>")),
+                           })*/
         )?;
         write_documentation(f, field.comment.as_ref())?;
 
-        if let Some(itemkind) = field.ty.kind.innermost_anonymous() {
+        /*if let Some(itemkind) = field.ty.kind.innermost_anonymous() {
             write_itemkind_fields(
                 f,
                 format!("&lt;&lt;anonymous {}&gt;&gt;", itemkind.keyword().unwrap()),
@@ -497,10 +386,10 @@ fn write_fields<W: std::fmt::Write>(f: &mut W, fields: &[parsed::Field]) -> std:
             write_documentation(f, decl.comment.as_ref())?;
             write_itemkind_fields(
                 f,
-                format!("{} {}", decl.kind.keyword().unwrap(), decl.name),
+                format!("{} ANON", decl.kind.keyword().unwrap()),
                 &decl.kind,
             )?;
-        }
+        }*/
     }
 
     Ok(())
@@ -529,7 +418,7 @@ fn write_struct_or_union<W: std::fmt::Write>(
             f,
             "<pre class=\"rust {}\">{}</pre>",
             ItemType::from(&item.kind),
-            item.code
+            ""
         )
     })?;
     write_documentation(f, item.comment.as_ref())?;
@@ -573,9 +462,7 @@ fn write_enum<W: std::fmt::Write>(
     item: &parsed::Item,
     e: &parsed::Enum,
 ) -> std::fmt::Result {
-    wrap_into_docblock(f, |f| {
-        write!(f, "<pre class=\"rust enum\">{};</pre>", item.code)
-    })?;
+    wrap_into_docblock(f, |f| write!(f, "<pre class=\"rust enum\">{};</pre>", ""))?;
     write_documentation(f, item.comment.as_ref())?;
 
     write_enum_variants(f, &e.variants)?;
@@ -588,7 +475,7 @@ fn write_function<W: std::fmt::Write>(
     item: &parsed::Item,
     _func: &parsed::Function,
 ) -> std::fmt::Result {
-    write!(f, "<pre class=\"rust fn\">{};</pre>", item.code)?;
+    write!(f, "<pre class=\"rust fn\">{};</pre>", "")?;
     write_documentation(f, item.comment.as_ref())?;
 
     Ok(())
@@ -619,7 +506,7 @@ fn write_typedef<W: std::fmt::Write>(
             _ => panic!("anonymous typedef is not implemented for: {:#?}", ty),
         }
     } else {
-        write!(f, "<pre class=\"rust type\">{};</pre>", item.code)?;
+        write!(f, "<pre class=\"rust type\">{};</pre>", "")?;
         write_documentation(f, item.comment.as_ref())?;
     }
 
@@ -631,7 +518,7 @@ fn write_variable<W: std::fmt::Write>(
     item: &parsed::Item,
     _variable: &parsed::Variable,
 ) -> std::fmt::Result {
-    write!(f, "<pre class=\"rust variable\">{};</pre>", item.code)?;
+    write!(f, "<pre class=\"rust variable\">{};</pre>", "")?;
     write_documentation(f, item.comment.as_ref())?;
 
     Ok(())
@@ -662,6 +549,8 @@ fn write_page_content<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std
         parsed::TypedefKind(..) => "Type Definition ",
         parsed::UnionKind(..) => "Union ",
         parsed::VariableKind(..) => "Variable ",
+        // TODO: does this make sense here?
+        parsed::NamespaceKind(..) => "Namespace ",
     };
     f.write_str(name)?;
 
@@ -687,6 +576,8 @@ fn write_page_content<W: std::fmt::Write>(f: &mut W, item: &parsed::Item) -> std
         }
         parsed::TypedefKind(typedef) => write_typedef(f, item, typedef)?,
         parsed::VariableKind(variable) => write_variable(f, item, variable)?,
+        // TODO: does this make sense here?
+        parsed::NamespaceKind(..) => (),
     }
 
     Ok(())
@@ -781,12 +672,10 @@ fn write_item<P: AsRef<std::path::Path>>(dst: P, item: &parsed::Item) -> Result<
 type NameDoc = (String, Option<String>);
 
 /// Construct a map of items shown in the sidebar to a plain-text summary of their docs.
-fn build_sidebar_items(
-    items: &parsed::ItemList,
-) -> std::collections::BTreeMap<String, Vec<NameDoc>> {
+fn build_sidebar_items(root: &parsed::Item) -> std::collections::BTreeMap<String, Vec<NameDoc>> {
     // BTreeMap instead of HashMap to get a sorted output
     let mut map: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
-    for item in &items.items {
+    for item in root.items().unwrap() {
         let short = item.type_();
         let myname = match item.name {
             None => continue,
@@ -814,14 +703,21 @@ fn main() -> Result<(), Error> {
     let cdb = load_cdb(cdb_file)?;
 
     let clang = clang::Clang::new().unwrap();
-    let mut items = parsed::ItemList::default();
+    let mut root = parsed::Item::root(&std::sync::Arc::new(std::path::PathBuf::new()));
 
     let cwd = std::env::current_dir()?;
     for command in &cdb {
-        process_file(command, &clang, &mut items)?;
+        // skip unsupported files
+        match command.file.extension().map(|o| o.to_str()).unwrap_or(None) {
+            Some("c") | Some("h") => (),
+            _ => continue,
+        }
+
+        let new_root = process_file(command, &clang)?;
+        root.extend(new_root);
     }
     std::env::set_current_dir(&cwd)?;
-    //println!("{:#?}", files);
+    println!("{:#?}", root);
 
     copy_statics(&dst)?;
 
@@ -832,14 +728,14 @@ fn main() -> Result<(), Error> {
     v.push_str("\\\n}');\naddSearchOptions(searchIndex);initSearch(searchIndex);");
     write(dst.join("search-index.js"), v.as_bytes())?;
 
-    let sidebar_items = build_sidebar_items(&items);
+    let sidebar_items = build_sidebar_items(&root);
     let v = format!(
         "initSidebarItems({});",
         serde_json::to_string(&sidebar_items).unwrap()
     );
     write(dst.join("sidebar-items.js"), v.as_bytes())?;
 
-    for item in &items.items {
+    for item in root.items().unwrap() {
         write_item(&dst, item)?;
     }
 

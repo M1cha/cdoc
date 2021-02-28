@@ -16,6 +16,8 @@ pub(crate) enum ItemType {
     Union = 19,
     Keyword = 21,
     Variable = 100,
+    Namespace = 101,
+    Class = 102,
 }
 
 impl From<&crate::parsed::ItemKind> for ItemType {
@@ -27,6 +29,7 @@ impl From<&crate::parsed::ItemKind> for ItemType {
             crate::parsed::FunctionKind(_) => ItemType::Function,
             crate::parsed::TypedefKind(_) => ItemType::Typedef,
             crate::parsed::VariableKind(_) => ItemType::Variable,
+            crate::parsed::NamespaceKind(_) => ItemType::Namespace,
         }
     }
 }
@@ -48,6 +51,8 @@ impl ItemType {
             ItemType::Constant => "constant",
             ItemType::Keyword => "keyword",
             ItemType::Variable => "variable",
+            ItemType::Namespace => "namespace",
+            ItemType::Class => "class",
         }
     }
 }
