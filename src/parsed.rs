@@ -258,6 +258,7 @@ pub(crate) enum TypeKind {
     Anonymous(Item),
     Pointer(Box<Type>),
     ConstantArray { len: usize, ty: Box<Type> },
+    Function { result: Box<Type>, args: Vec<Type> },
 }
 
 #[derive(Debug, PartialEq)]
@@ -266,25 +267,40 @@ pub(crate) struct Type {
     pub(crate) kind: TypeKind,
 }
 
+pub(crate) trait TypeFormatter {
+    fn fmt_item(&self, f: &mut std::fmt::Formatter, itemref: &ItemRef) -> std::fmt::Result;
+    fn fmt_anonymous_item(&self, f: &mut std::fmt::Formatter, item: &Item) -> std::fmt::Result;
+}
+
 impl Type {
-    pub(crate) fn print<W: std::fmt::Write>(
+    pub(crate) fn fmt<F: TypeFormatter>(
         &self,
-        w: &mut W,
-        mut f: impl FnMut(&mut W, &ItemRef) -> std::fmt::Result,
+        f: &mut std::fmt::Formatter,
+        tf: &F,
     ) -> std::fmt::Result {
         match &self.kind {
-            TypeKind::Unknown(s) => w.write_str(s)?,
-            TypeKind::ItemRef(itemref) => f(w, itemref)?,
-            TypeKind::Anonymous(item) => write!(w, "ANON")?,
+            TypeKind::Unknown(s) => f.write_str(s)?,
+            TypeKind::ItemRef(itemref) => tf.fmt_item(f, itemref)?,
+            TypeKind::Anonymous(item) => tf.fmt_anonymous_item(f, item)?,
             TypeKind::Pointer(ty) => {
-                w.write_str("ptr(")?;
-                ty.print(w, f)?;
-                w.write_str(")")?;
+                f.write_str("ptr(")?;
+                ty.fmt(f, tf)?;
+                f.write_str(")")?;
             }
             TypeKind::ConstantArray { len, ty } => {
-                w.write_str("[")?;
-                ty.print(w, f)?;
-                write!(w, "; {}]", len)?;
+                f.write_str("[")?;
+                ty.fmt(f, tf)?;
+                write!(f, "; {}]", len)?;
+            }
+            TypeKind::Function { result, args } => {
+                result.fmt(f, tf)?;
+                f.write_str(" (")?;
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    arg.fmt(f, tf)?;
+                }
             }
         }
         Ok(())
@@ -326,7 +342,6 @@ impl Type {
             .as_ref()
             .map(|tydecl| tydecl.is_anonymous() || tydecl.get_name().is_none())
             .unwrap_or(false);
-        //println!("DECL: {:?} ANON:{:?}", tydecl, is_anonymous);
         Self {
             isconst: clangty.is_const_qualified(),
             kind: if is_anonymous {
@@ -361,6 +376,19 @@ impl Type {
                     clang::TypeKind::Record | clang::TypeKind::Typedef => {
                         TypeKind::ItemRef(ItemRef::from(&clangty.get_declaration().unwrap()))
                     }
+
+                    clang::TypeKind::FunctionPrototype => TypeKind::Function {
+                        result: Box::new(Type::from_clangtype(
+                            &clangty.get_result_type().unwrap(),
+                            compilationunit,
+                        )),
+                        args: clangty
+                            .get_argument_types()
+                            .unwrap()
+                            .iter()
+                            .map(|arg_type| Type::from_clangtype(arg_type, compilationunit))
+                            .collect(),
+                    },
 
                     unknown => {
                         if let Some(s) = Self::clangty_to_primitive_str(unknown) {

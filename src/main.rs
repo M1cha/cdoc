@@ -13,7 +13,8 @@ mod static_files;
 use item_type::ItemType;
 use itertools::Itertools;
 use rayon::prelude::*;
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::Write as _;
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -96,7 +97,7 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
             "-fno-builtin",
             "-nostdinc",
             "-ffreestanding",
-            //"-xc++",
+            "-xc++",
         ])
         .parse()
         .unwrap();
@@ -361,52 +362,108 @@ fn write_itemkind_fields<W: std::fmt::Write, N: std::fmt::Display>(
     Ok(())
 }
 
-struct TypeFormatter<'a> {
+fn fmt_item_code(
+    cx: &Context,
+    f: &mut std::fmt::Formatter,
+    item: &parsed::Item,
+) -> std::fmt::Result {
+    write!(f, "{}", ItemType::from(&item.kind))?;
+    if let Some(name) = &item.name {
+        write!(f, " {}", name)?;
+    }
+
+    f.write_str(" {\n")?;
+
+    let mut fi = indenter::indented(f).with_str("    ");
+    match &item.kind {
+        parsed::StructKind(parsed::Struct { fields, .. })
+        | parsed::UnionKind(parsed::Union { fields, .. }) => {
+            for (index, field) in fields.iter().enumerate() {
+                write!(fi, "{}", HtmlTypeFormatter::new(cx, &field.ty))?;
+                if let Some(name) = &field.name {
+                    write!(fi, " {}", name)?;
+                }
+                fi.write_str(";\n")?;
+            }
+        }
+        parsed::EnumKind(e) => {
+            for (index, variant) in e.variants.iter().enumerate() {
+                write!(fi, "{}", variant.name)?;
+                if let Some(value) = &variant.value {
+                    write!(fi, " = {}", value)?;
+                }
+                fi.write_str(",\n")?;
+            }
+        }
+        _ => {
+            eprintln!("unsupported item: {:?}", item);
+            return Err(std::fmt::Error);
+        }
+    }
+
+    f.write_str("}")?;
+
+    Ok(())
+}
+
+struct HtmlTypeFormatter<'a> {
     cx: &'a Context,
     ty: &'a parsed::Type,
 }
 
-impl<'a> TypeFormatter<'a> {
+impl<'a> HtmlTypeFormatter<'a> {
     pub(crate) fn new(cx: &'a Context, ty: &'a parsed::Type) -> Self {
         Self { cx, ty }
     }
 }
 
-impl<'a> std::fmt::Display for TypeFormatter<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.ty.print(f, |f, itemref| {
-            for (index, (name, ty)) in itemref.path.iter().enumerate() {
-                if index > 0 {
-                    f.write_str("::")?;
-                }
-
-                write!(
-                    f,
-                    "<a{} class=\"{ty}\">{name}</a>",
-                    href = format::display_fn(|f| match ty {
-                        ItemType::Primitive => Ok(()),
-                        _ => write!(
-                            f,
-                            " href=\"{root}{path}{html}\"",
-                            root = self.cx.root_path(),
-                            path = format::ensure_trailing_slash(
-                                &itemref.path[0..index]
-                                    .iter()
-                                    .map(|(name, _)| name)
-                                    .join("/")
-                            ),
-                            html = format::display_fn(|f| match ty {
-                                ItemType::Namespace => write!(f, "{}/index.html", name),
-                                _ => write!(f, "{}.{}.html", ty, name),
-                            }),
-                        ),
-                    }),
-                    ty = ty,
-                    name = name
-                )?;
+impl<'a> parsed::TypeFormatter for HtmlTypeFormatter<'a> {
+    fn fmt_item(&self, f: &mut std::fmt::Formatter, itemref: &parsed::ItemRef) -> std::fmt::Result {
+        for (index, (name, ty)) in itemref.path.iter().enumerate() {
+            if index > 0 {
+                f.write_str("::")?;
             }
-            Ok(())
-        })
+
+            write!(
+                f,
+                "<a{} class=\"{ty}\">{name}</a>",
+                href = format::display_fn(|f| match ty {
+                    ItemType::Primitive => Ok(()),
+                    _ => write!(
+                        f,
+                        " href=\"{root}{path}{html}\"",
+                        root = self.cx.root_path(),
+                        path = format::ensure_trailing_slash(
+                            &itemref.path[0..index]
+                                .iter()
+                                .map(|(name, _)| name)
+                                .join("/")
+                        ),
+                        html = format::display_fn(|f| match ty {
+                            ItemType::Namespace => write!(f, "{}/index.html", name),
+                            _ => write!(f, "{}.{}.html", ty, name),
+                        }),
+                    ),
+                }),
+                ty = ty,
+                name = name
+            )?;
+        }
+        Ok(())
+    }
+
+    fn fmt_anonymous_item(
+        &self,
+        f: &mut std::fmt::Formatter,
+        item: &parsed::Item,
+    ) -> std::fmt::Result {
+        fmt_item_code(self.cx, f, item)
+    }
+}
+
+impl<'a> std::fmt::Display for HtmlTypeFormatter<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.ty.fmt(f, self)
     }
 }
 
@@ -435,7 +492,7 @@ fn write_fields<W: std::fmt::Write>(
             item_type = ItemType::StructField,
             id = id,
             name = name,
-            ty = TypeFormatter::new(cx, &field.ty),
+            ty = HtmlTypeFormatter::new(cx, &field.ty),
         )?;
         write_documentation(f, field.comment.as_ref())?;
 
@@ -483,9 +540,9 @@ fn write_struct_or_union<W: std::fmt::Write>(
     wrap_into_docblock(f, |f| {
         write!(
             f,
-            "<pre class=\"rust {}\">{}</pre>",
-            ItemType::from(&item.kind),
-            ""
+            "<pre class=\"rust {ty}\">{code};</pre>",
+            ty = ItemType::from(&item.kind),
+            code = format::display_fn(|f| { fmt_item_code(cx, f, item) })
         )
     })?;
     write_documentation(f, item.comment.as_ref())?;
@@ -525,6 +582,7 @@ fn write_enum_variants<W: std::fmt::Write>(
 }
 
 fn write_enum<W: std::fmt::Write>(
+    cx: &Context,
     f: &mut W,
     item: &parsed::Item,
     e: &parsed::Enum,
@@ -532,18 +590,8 @@ fn write_enum<W: std::fmt::Write>(
     wrap_into_docblock(f, |f| {
         write!(
             f,
-            "<pre class=\"rust enum\">enum {} {{\n{}}};</pre>",
-            item.name.as_ref().unwrap(),
-            format::display_fn(|f| {
-                for (index, variant) in e.variants.iter().enumerate() {
-                    write!(f, "    {}", variant.name)?;
-                    if let Some(value) = &variant.value {
-                        write!(f, " = {}", value)?;
-                    }
-                    f.write_str(",\n")?;
-                }
-                Ok(())
-            })
+            "<pre class=\"rust enum\">{};</pre>",
+            format::display_fn(|f| fmt_item_code(cx, f, item))
         )
     })?;
     write_documentation(f, item.comment.as_ref())?;
@@ -562,7 +610,7 @@ fn write_function<W: std::fmt::Write>(
     write!(
         f,
         "<pre class=\"rust fn\">{} {}({});</pre>",
-        TypeFormatter::new(cx, &func.result),
+        HtmlTypeFormatter::new(cx, &func.result),
         item.name.as_ref().unwrap(),
         format::display_fn(|f| {
             for (index, (name, ty)) in func.arguments.iter().enumerate() {
@@ -571,7 +619,7 @@ fn write_function<W: std::fmt::Write>(
                 }
 
                 write!(f, "{}: ", name)?;
-                write!(f, "{}", TypeFormatter::new(cx, ty))?;
+                write!(f, "{}", HtmlTypeFormatter::new(cx, ty))?;
             }
 
             if func.is_variadic {
@@ -597,7 +645,7 @@ fn write_typedef<W: std::fmt::Write>(
     write!(
         f,
         "<pre class=\"rust type\">typedef {} {};</pre>",
-        TypeFormatter::new(cx, &typedef.ty),
+        HtmlTypeFormatter::new(cx, &typedef.ty),
         item.name.as_ref().unwrap()
     )?;
     write_documentation(f, item.comment.as_ref())?;
@@ -614,7 +662,7 @@ fn write_variable<W: std::fmt::Write>(
     write!(
         f,
         "<pre class=\"rust variable\">{} {};</pre>",
-        TypeFormatter::new(cx, &variable.ty),
+        HtmlTypeFormatter::new(cx, &variable.ty),
         item.name.as_ref().unwrap()
     )?;
     write_documentation(f, item.comment.as_ref())?;
@@ -808,7 +856,7 @@ fn write_page_content<W: std::fmt::Write>(
         write_index(cx, f, item)?;
     } else {
         match &item.kind {
-            parsed::EnumKind(func) => write_enum(f, item, func)?,
+            parsed::EnumKind(func) => write_enum(cx, f, item, func)?,
             parsed::FunctionKind(func) => write_function(cx, f, item, func)?,
             parsed::StructKind(parsed::Struct { fields, .. })
             | parsed::UnionKind(parsed::Union { fields, .. }) => {
