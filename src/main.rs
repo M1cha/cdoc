@@ -29,6 +29,8 @@ enum Error {
 
     #[error("exit status: {0}")]
     ExitStatus(std::process::ExitStatus),
+    #[error("can't resolve entity path")]
+    CantResolveEntityPath,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -48,7 +50,7 @@ fn load_cdb<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<CompileCommand>, E
 fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed::Item, Error> {
     std::env::set_current_dir(&command.directory)?;
     let compilationunit = std::sync::Arc::new(std::fs::canonicalize(&command.file)?);
-    let mut outfile = tempfile::Builder::new()
+    let outfile = tempfile::Builder::new()
         .suffix(&format!(
             ".{}",
             command.file.extension().unwrap().to_str().unwrap()
@@ -97,14 +99,12 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
             "-fno-builtin",
             "-nostdinc",
             "-ffreestanding",
-            "-xc++",
+            //"-xc++",
         ])
         .parse()
         .unwrap();
 
-    let root = parsed::parse_tu(&tu.get_entity(), &compilationunit);
-
-    Ok(root)
+    parsed::parse_tu(&tu.get_entity(), &compilationunit)
 }
 
 fn open_file<P: AsRef<std::path::Path>>(dst: P) -> Result<std::fs::File, Error> {
@@ -378,7 +378,7 @@ fn fmt_item_code(
     match &item.kind {
         parsed::StructKind(parsed::Struct { fields, .. })
         | parsed::UnionKind(parsed::Union { fields, .. }) => {
-            for (index, field) in fields.iter().enumerate() {
+            for field in fields.iter() {
                 write!(fi, "{}", HtmlTypeFormatter::new(cx, &field.ty))?;
                 if let Some(name) = &field.name {
                     write!(fi, " {}", name)?;
@@ -387,7 +387,7 @@ fn fmt_item_code(
             }
         }
         parsed::EnumKind(e) => {
-            for (index, variant) in e.variants.iter().enumerate() {
+            for variant in e.variants.iter() {
                 write!(fi, "{}", variant.name)?;
                 if let Some(value) = &variant.value {
                     write!(fi, " = {}", value)?;
@@ -617,9 +617,11 @@ fn write_function<W: std::fmt::Write>(
                 if index > 0 {
                     f.write_str(", ")?;
                 }
-
-                write!(f, "{}: ", name)?;
                 write!(f, "{}", HtmlTypeFormatter::new(cx, ty))?;
+
+                if let Some(name) = name {
+                    write!(f, " {}", name)?;
+                }
             }
 
             if func.is_variadic {
@@ -782,7 +784,8 @@ fn write_index<W: std::fmt::Write>(
             )?;
         }
 
-        let doc_value = myitem.comment.as_ref().map(|c| c.as_str()).unwrap_or("");
+        // TODO: parse comments and extract brief
+        let _doc_value = myitem.comment.as_ref().map(|c| c.as_str()).unwrap_or("");
         write!(
             f,
             "<tr class=\"module-item\">\

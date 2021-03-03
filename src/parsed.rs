@@ -1,5 +1,6 @@
 pub(crate) use self::ItemKind::*;
 
+use crate::Error;
 use std::convert::TryInto;
 use std::io::BufRead;
 
@@ -12,7 +13,7 @@ macro_rules! unwrap_enum {
     };
 }
 
-fn get_comment(entity: &clang::Entity<'_>) -> Result<Option<String>, crate::Error> {
+fn get_comment(entity: &clang::Entity<'_>) -> Result<Option<String>, Error> {
     let mut comment = entity.get_comment();
     if comment.is_some() {
         let entity_loc = entity.get_location().unwrap().get_presumed_location();
@@ -58,8 +59,8 @@ pub(crate) struct ItemRef {
     pub(crate) path: Vec<(String, crate::ItemType)>,
 }
 
-impl From<&clang::Entity<'_>> for ItemRef {
-    fn from(entity: &clang::Entity<'_>) -> Self {
+impl ItemRef {
+    fn from_entity(entity: &clang::Entity<'_>) -> Option<Self> {
         let mut path = Vec::new();
 
         let mut current = entity.clone();
@@ -78,14 +79,14 @@ impl From<&clang::Entity<'_>> for ItemRef {
                         _ => unimplemented!("{:?}", kind),
                     };
 
-                    path.push((current.get_name().unwrap(), itemtype));
-                    current = current.get_semantic_parent().unwrap();
+                    path.push((current.get_name()?, itemtype));
+                    current = current.get_semantic_parent()?;
                 }
             }
         }
         path.reverse();
 
-        Self { path }
+        Some(Self { path })
     }
 }
 
@@ -95,40 +96,48 @@ struct Context {
 }
 
 impl Context {
-    fn parse_children(&mut self, parent_entity: &clang::Entity<'_>) {
+    fn parse_children(&mut self, parent_entity: &clang::Entity<'_>) -> Result<(), Error> {
         for entity in parent_entity.get_children() {
             // apparently is_anonymous can return false for nameless typedef
             // structs.
-            if entity.get_name().is_none() {
-                continue;
-            }
-            if entity.is_anonymous() {
+            if entity.is_anonymous() || entity.get_name().is_none() {
+                // we still want to scan the children because e.g. an anonymous
+                // struct could contain a named struct whose semantic parent is
+                // the translation unit
+                self.parse_children(&entity)?;
                 continue;
             }
 
-            if let Some(item) = Item::from_entity(&entity, &self.compilationunit).unwrap() {
+            if let Some(item) = Item::from_entity(&entity, &self.compilationunit)? {
                 let is_container = item.is_container();
-                self.root.kind.push_to_semantic_parent(item, &entity);
+                match self.root.kind.push_to_semantic_parent(item, &entity) {
+                    // with C++ it is possible to define unreachable types,
+                    // so just skip them.
+                    Err(Error::CantResolveEntityPath) => (),
+                    Err(e) => return Err(e),
+                    Ok(()) => (),
+                }
                 if is_container {
-                    self.parse_children(&entity);
+                    self.parse_children(&entity)?;
                 }
             }
         }
+        Ok(())
     }
 }
 
 pub(crate) fn parse_tu(
     tu: &clang::Entity<'_>,
     compilationunit: &std::sync::Arc<std::path::PathBuf>,
-) -> Item {
+) -> Result<Item, Error> {
     let mut ctx = Context {
         compilationunit: compilationunit.clone(),
         root: Item::root(compilationunit),
     };
 
-    ctx.parse_children(tu);
+    ctx.parse_children(tu)?;
 
-    ctx.root
+    Ok(ctx.root)
 }
 
 #[enum_dispatch::enum_dispatch]
@@ -173,32 +182,34 @@ pub(crate) struct Enum {
     pub(crate) variants: Vec<EnumVariant>,
 }
 
-impl From<&clang::Entity<'_>> for Enum {
-    fn from(entity: &clang::Entity<'_>) -> Self {
-        Self {
-            variants: entity
-                .get_children()
-                .iter()
-                .filter(|entity| entity.get_kind() == clang::EntityKind::EnumConstantDecl)
-                .map(|variant_entity| EnumVariant {
-                    name: variant_entity.get_display_name().unwrap(),
-                    comment: get_comment(variant_entity).unwrap(),
-                    value: variant_entity
-                        .get_enum_constant_value()
-                        .map(|(signed, unsigned)| {
-                            if entity
-                                .get_enum_underlying_type()
-                                .unwrap()
-                                .is_signed_integer()
-                            {
-                                EnumValue::Signed(signed)
-                            } else {
-                                EnumValue::Unsigned(unsigned)
-                            }
-                        }),
-                })
-                .collect(),
+impl Enum {
+    fn from_entity(entity: &clang::Entity<'_>) -> Result<Self, Error> {
+        let mut variants = Vec::new();
+        for variant_entity in entity
+            .get_children()
+            .iter()
+            .filter(|entity| entity.get_kind() == clang::EntityKind::EnumConstantDecl)
+        {
+            variants.push(EnumVariant {
+                name: variant_entity.get_display_name().unwrap(),
+                comment: get_comment(variant_entity)?,
+                value: variant_entity
+                    .get_enum_constant_value()
+                    .map(|(signed, unsigned)| {
+                        if entity
+                            .get_enum_underlying_type()
+                            .unwrap()
+                            .is_signed_integer()
+                        {
+                            EnumValue::Signed(signed)
+                        } else {
+                            EnumValue::Unsigned(unsigned)
+                        }
+                    }),
+            })
         }
+
+        Ok(Self { variants })
     }
 }
 
@@ -212,7 +223,7 @@ impl ItemKindFns for Enum {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Function {
-    pub(crate) arguments: Vec<(String, Type)>,
+    pub(crate) arguments: Vec<(Option<String>, Type)>,
     pub(crate) result: Box<Type>,
     pub(crate) is_variadic: bool,
 }
@@ -221,25 +232,23 @@ impl Function {
     fn from_entity(
         entity: &clang::Entity<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Self {
-        Self {
-            arguments: entity
-                .get_arguments()
-                .unwrap()
-                .iter()
-                .map(|arg_entity| {
-                    (
-                        arg_entity.get_name().unwrap(),
-                        Type::from_clangtype(&arg_entity.get_type().unwrap(), compilationunit),
-                    )
-                })
-                .collect(),
+    ) -> Result<Self, Error> {
+        let mut arguments = Vec::new();
+        for arg_entity in entity.get_arguments().unwrap() {
+            arguments.push((
+                arg_entity.get_name(),
+                Type::from_clangtype(&arg_entity.get_type().unwrap(), compilationunit)?,
+            ));
+        }
+
+        Ok(Self {
+            arguments,
             result: Box::new(Type::from_clangtype(
                 &entity.get_result_type().unwrap(),
                 compilationunit,
-            )),
+            )?),
             is_variadic: entity.is_variadic(),
-        }
+        })
     }
 }
 
@@ -280,12 +289,24 @@ impl Type {
     ) -> std::fmt::Result {
         match &self.kind {
             TypeKind::Unknown(s) => f.write_str(s)?,
-            TypeKind::ItemRef(itemref) => tf.fmt_item(f, itemref)?,
-            TypeKind::Anonymous(item) => tf.fmt_anonymous_item(f, item)?,
+            TypeKind::ItemRef(itemref) => {
+                if self.isconst {
+                    f.write_str("const ")?;
+                }
+                tf.fmt_item(f, itemref)?;
+            }
+            TypeKind::Anonymous(item) => {
+                if self.isconst {
+                    f.write_str("const ")?;
+                }
+                tf.fmt_anonymous_item(f, item)?;
+            }
             TypeKind::Pointer(ty) => {
-                f.write_str("ptr(")?;
                 ty.fmt(f, tf)?;
-                f.write_str(")")?;
+                f.write_str(" *")?;
+                if self.isconst {
+                    f.write_str("const")?;
+                }
             }
             TypeKind::ConstantArray { len, ty } => {
                 f.write_str("[")?;
@@ -301,6 +322,7 @@ impl Type {
                     }
                     arg.fmt(f, tf)?;
                 }
+                f.write_str(")")?;
             }
         }
         Ok(())
@@ -336,20 +358,16 @@ impl Type {
     fn from_clangtype(
         clangty: &clang::Type<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let tydecl = clangty.get_declaration();
         let is_anonymous = tydecl
             .as_ref()
             .map(|tydecl| tydecl.is_anonymous() || tydecl.get_name().is_none())
             .unwrap_or(false);
-        Self {
+        Ok(Self {
             isconst: clangty.is_const_qualified(),
             kind: if is_anonymous {
-                TypeKind::Anonymous(
-                    Item::from_entity(&tydecl.unwrap(), compilationunit)
-                        .unwrap()
-                        .unwrap(),
-                )
+                TypeKind::Anonymous(Item::from_entity(&tydecl.unwrap(), compilationunit)?.unwrap())
             } else {
                 match &clangty.get_kind() {
                     clang::TypeKind::ConstantArray => TypeKind::ConstantArray {
@@ -357,36 +375,46 @@ impl Type {
                         ty: Box::new(Self::from_clangtype(
                             &clangty.get_element_type().unwrap(),
                             compilationunit,
-                        )),
+                        )?),
                     },
 
                     clang::TypeKind::Pointer => TypeKind::Pointer(Box::new(Self::from_clangtype(
                         &clangty.get_pointee_type().unwrap(),
                         compilationunit,
-                    ))),
+                    )?)),
 
-                    clang::TypeKind::Elaborated => TypeKind::ItemRef(ItemRef::from(
-                        &clangty
+                    clang::TypeKind::Elaborated => {
+                        let decl = &clangty
                             .get_elaborated_type()
                             .unwrap()
                             .get_declaration()
-                            .unwrap(),
-                    )),
+                            .unwrap();
 
-                    clang::TypeKind::Record | clang::TypeKind::Typedef => {
-                        TypeKind::ItemRef(ItemRef::from(&clangty.get_declaration().unwrap()))
+                        if let Some(itemref) = ItemRef::from_entity(&decl) {
+                            TypeKind::ItemRef(itemref)
+                        } else {
+                            TypeKind::Anonymous(
+                                Item::from_entity(&tydecl.unwrap(), compilationunit)?.unwrap(),
+                            )
+                        }
                     }
+
+                    clang::TypeKind::Record | clang::TypeKind::Typedef => TypeKind::ItemRef(
+                        ItemRef::from_entity(&clangty.get_declaration().unwrap()).unwrap(),
+                    ),
 
                     clang::TypeKind::FunctionPrototype => TypeKind::Function {
                         result: Box::new(Type::from_clangtype(
                             &clangty.get_result_type().unwrap(),
                             compilationunit,
-                        )),
+                        )?),
                         args: clangty
                             .get_argument_types()
                             .unwrap()
                             .iter()
-                            .map(|arg_type| Type::from_clangtype(arg_type, compilationunit))
+                            .map(|arg_type| {
+                                Type::from_clangtype(arg_type, compilationunit).unwrap()
+                            })
                             .collect(),
                     },
 
@@ -405,7 +433,7 @@ impl Type {
                     }
                 }
             },
-        }
+        })
     }
 }
 
@@ -425,29 +453,31 @@ pub(crate) struct Struct {
 fn get_fields(
     container_entity: &clang::Entity<'_>,
     compilationunit: &std::sync::Arc<std::path::PathBuf>,
-) -> Vec<Field> {
+) -> Result<Vec<Field>, Error> {
     let ty = container_entity.get_type().unwrap();
     let fields = ty.get_fields().unwrap();
 
-    fields
-        .iter()
-        .map(|entity| Field {
+    let mut v = Vec::new();
+    for entity in &fields {
+        v.push(Field {
             name: entity.get_display_name(),
-            ty: Type::from_clangtype(&entity.get_type().unwrap(), compilationunit),
+            ty: Type::from_clangtype(&entity.get_type().unwrap(), compilationunit)?,
             comment: entity.get_comment(),
-        })
-        .collect()
+        });
+    }
+
+    Ok(v)
 }
 
 impl Struct {
     fn from_entity(
         entity: &clang::Entity<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Self {
-        Self {
-            fields: get_fields(entity, compilationunit),
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            fields: get_fields(entity, compilationunit)?,
             items: Vec::new(),
-        }
+        })
     }
 }
 
@@ -475,11 +505,11 @@ impl Typedef {
     fn from_entity(
         entity: &clang::Entity<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let ty = entity.get_typedef_underlying_type().unwrap();
-        Self {
-            ty: Box::new(Type::from_clangtype(&ty, compilationunit)),
-        }
+        Ok(Self {
+            ty: Box::new(Type::from_clangtype(&ty, compilationunit)?),
+        })
     }
 }
 
@@ -500,11 +530,11 @@ impl Union {
     fn from_entity(
         entity: &clang::Entity<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Self {
-        Self {
-            fields: get_fields(entity, compilationunit),
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            fields: get_fields(entity, compilationunit)?,
             items: Vec::new(),
-        }
+        })
     }
 }
 
@@ -532,15 +562,13 @@ impl Variable {
     fn from_entity(
         entity: &clang::Entity<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Self {
-        {
-            Self {
-                ty: Box::new(Type::from_clangtype(
-                    &entity.get_type().unwrap(),
-                    compilationunit,
-                )),
-            }
-        }
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            ty: Box::new(Type::from_clangtype(
+                &entity.get_type().unwrap(),
+                compilationunit,
+            )?),
+        })
     }
 }
 
@@ -611,15 +639,6 @@ impl ItemKind {
         }
     }
 
-    pub(crate) fn keyword(&self) -> Option<&str> {
-        match self {
-            StructKind(..) => Some("struct"),
-            UnionKind(..) => Some("union"),
-            EnumKind(..) => Some("enum"),
-            _ => None,
-        }
-    }
-
     /// pushes a new item to the kind if it supports children
     /// if it exists, either merge them or push it as a duplicate.
     /// returns the index of the new item or existing item ignoring duplicates
@@ -653,53 +672,66 @@ impl ItemKind {
     }
 
     /// push the new item to the given relative path
-    fn push_to_path(&mut self, new_item: Item, path: &[(String, clang::Entity<'_>)]) {
+    fn push_to_path(
+        &mut self,
+        new_item: Item,
+        path: &[(String, clang::Entity<'_>)],
+    ) -> Result<(), Error> {
         if let Some((name, entity)) = path.first() {
             if let Some(item) =
                 self.items_mut().unwrap().iter_mut().find(|e| {
                     e.kind.eq_clangkind(&entity.get_kind()) && e.name.as_ref() == Some(name)
                 })
             {
-                item.kind.push_to_path(new_item, &path[1..]);
+                item.kind.push_to_path(new_item, &path[1..])?;
             } else {
                 let index = self.push_deduplicate(
-                    Item::from_entity(entity, &new_item.compilationunit)
-                        .unwrap()
-                        .unwrap(),
+                    Item::from_entity(entity, &new_item.compilationunit)?.unwrap(),
                 );
 
                 self.items_mut().unwrap()[index]
                     .kind
-                    .push_to_path(new_item, &path[1..]);
+                    .push_to_path(new_item, &path[1..])?;
             }
         } else {
             self.push_deduplicate(new_item);
         }
+
+        Ok(())
     }
 
-    /// under the assumption that this itemkind dis the root namespace,
+    /// under the assumption that this itemkind is the root namespace,
     /// push it to the semantic path creating missing parents along the way
     pub(crate) fn push_to_semantic_parent(
         &mut self,
         new_item: Item,
         new_entity: &clang::Entity<'_>,
-    ) {
+    ) -> Result<(), Error> {
         let mut path = Vec::new();
         {
-            let mut current = new_entity.get_semantic_parent().unwrap();
+            let mut current = new_entity
+                .get_semantic_parent()
+                .ok_or(Error::CantResolveEntityPath)?;
             loop {
                 let kind = current.get_kind();
                 match kind {
                     clang::EntityKind::TranslationUnit => break,
                     _ => {
-                        path.push((current.get_name().unwrap(), current.clone()));
-                        current = current.get_semantic_parent().unwrap();
+                        path.push((
+                            current.get_name().ok_or(Error::CantResolveEntityPath)?,
+                            current.clone(),
+                        ));
+                        current = current
+                            .get_semantic_parent()
+                            .ok_or(Error::CantResolveEntityPath)?;
                     }
                 }
             }
             path.reverse();
         }
-        self.push_to_path(new_item, &path);
+        self.push_to_path(new_item, &path)?;
+
+        Ok(())
     }
 }
 
@@ -753,19 +785,19 @@ impl Item {
         }
 
         let kind = match entity.get_kind() {
-            clang::EntityKind::EnumDecl => EnumKind(Enum::from(entity)),
+            clang::EntityKind::EnumDecl => EnumKind(Enum::from_entity(entity)?),
             clang::EntityKind::FunctionDecl => {
-                FunctionKind(Function::from_entity(entity, compilationunit))
+                FunctionKind(Function::from_entity(entity, compilationunit)?)
             }
             clang::EntityKind::StructDecl => {
-                StructKind(Struct::from_entity(entity, compilationunit))
+                StructKind(Struct::from_entity(entity, compilationunit)?)
             }
             clang::EntityKind::TypedefDecl => {
-                TypedefKind(Typedef::from_entity(entity, compilationunit))
+                TypedefKind(Typedef::from_entity(entity, compilationunit)?)
             }
-            clang::EntityKind::UnionDecl => UnionKind(Union::from_entity(entity, compilationunit)),
+            clang::EntityKind::UnionDecl => UnionKind(Union::from_entity(entity, compilationunit)?),
             clang::EntityKind::VarDecl => {
-                VariableKind(Variable::from_entity(entity, compilationunit))
+                VariableKind(Variable::from_entity(entity, compilationunit)?)
             }
             clang::EntityKind::Namespace => NamespaceKind(Namespace::default()),
             _ => return Ok(None),
