@@ -30,6 +30,7 @@ impl From<&crate::parsed::ItemKind> for ItemType {
             crate::parsed::TypedefKind(_) => ItemType::Typedef,
             crate::parsed::VariableKind(_) => ItemType::Variable,
             crate::parsed::NamespaceKind(_) => ItemType::Namespace,
+            crate::parsed::ClassKind(_) => ItemType::Class,
         }
     }
 }

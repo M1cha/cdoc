@@ -68,6 +68,7 @@ impl ItemRef {
 
         let mut current = entity.clone();
 
+        // TODO: remove and handle subitems generically
         if current.get_kind() == clang::EntityKind::EnumConstantDecl {
             subref = Some(current.get_name().unwrap());
             current = current.get_semantic_parent()?;
@@ -77,15 +78,42 @@ impl ItemRef {
             let kind = current.get_kind();
             match kind {
                 clang::EntityKind::TranslationUnit => break,
+                clang::EntityKind::LinkageSpec => {
+                    current = current.get_semantic_parent()?;
+                    continue;
+                }
                 _ => {
                     let itemtype = match kind {
                         clang::EntityKind::StructDecl => crate::ItemType::Struct,
                         clang::EntityKind::UnionDecl => crate::ItemType::Union,
-                        clang::EntityKind::ClassDecl => crate::ItemType::Class,
+                        clang::EntityKind::ClassDecl
+                        | clang::EntityKind::ClassTemplate
+                        | clang::EntityKind::ClassTemplatePartialSpecialization => {
+                            crate::ItemType::Class
+                        }
                         clang::EntityKind::Namespace => crate::ItemType::Namespace,
                         clang::EntityKind::EnumDecl => crate::ItemType::Enum,
                         clang::EntityKind::TypedefDecl => crate::ItemType::Typedef,
-                        _ => unimplemented!("{:?}", kind),
+                        clang::EntityKind::VarDecl | clang::EntityKind::FieldDecl => {
+                            crate::ItemType::Variable
+                        }
+                        clang::EntityKind::FunctionDecl
+                        | clang::EntityKind::FunctionTemplate
+                        | clang::EntityKind::Constructor
+                        | clang::EntityKind::Destructor
+                        | clang::EntityKind::Method => crate::ItemType::Function,
+
+                        // TODO
+                        clang::EntityKind::TypeAliasDecl => crate::ItemType::Typedef,
+                        clang::EntityKind::ParmDecl => crate::ItemType::Variable,
+                        clang::EntityKind::NonTypeTemplateParameter => crate::ItemType::Variable,
+
+                        _ => unimplemented!(
+                            "{:?}; {:?} loc:{:?}",
+                            kind,
+                            current,
+                            current.get_location().map(|l| l.get_presumed_location())
+                        ),
                     };
 
                     path.push((current.get_name()?, itemtype));
@@ -119,7 +147,13 @@ impl Context {
 
             if let Some(item) = Item::from_entity(&entity, &self.compilationunit)? {
                 let is_container = item.is_container();
-                match self.root.kind.push_to_semantic_parent(item, &entity) {
+                match self
+                    .root
+                    .kind
+                    .items_mut()
+                    .unwrap()
+                    .push_to_semantic_parent(item, &entity)
+                {
                     // with C++ it is possible to define unreachable types,
                     // so just skip them.
                     Err(Error::CantResolveEntityPath) => (),
@@ -149,17 +183,16 @@ pub(crate) fn parse_tu(
     Ok(ctx.root)
 }
 
-#[enum_dispatch::enum_dispatch]
 trait ItemKindFns {
     /// if the other itemkind is similar enough, extend this item with it's data and return true
     /// Otherwise, return false
-    fn try_update(&mut self, other: &mut ItemKind) -> bool;
+    fn try_update(&mut self, other: &mut Self) -> bool;
 
-    fn items(&self) -> Option<&[Item]> {
+    fn items(&self) -> Option<&ItemList> {
         None
     }
 
-    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+    fn items_mut(&mut self) -> Option<&mut ItemList> {
         None
     }
 
@@ -234,9 +267,7 @@ impl Enum {
 }
 
 impl ItemKindFns for Enum {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, EnumKind);
-
+    fn try_update(&mut self, other: &mut Enum) -> bool {
         self.variants == other.variants
     }
 
@@ -250,6 +281,7 @@ pub(crate) struct Function {
     pub(crate) arguments: Vec<(Option<String>, Type)>,
     pub(crate) result: Box<Type>,
     pub(crate) is_variadic: bool,
+    pub(crate) overridden_methods: Vec<ItemRef>,
     pub(crate) outerty: Box<Type>,
 }
 
@@ -259,13 +291,14 @@ impl Function {
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
     ) -> Result<Self, Error> {
         let mut arguments = Vec::new();
-        for arg_entity in entity.get_arguments().unwrap() {
-            arguments.push((
-                arg_entity.get_name(),
-                Type::from_clangtype(&arg_entity.get_type().unwrap(), compilationunit)?,
-            ));
+        if let Some(clangargs) = entity.get_arguments() {
+            for arg_entity in clangargs {
+                arguments.push((
+                    arg_entity.get_name(),
+                    Type::from_clangtype(&arg_entity.get_type().unwrap(), compilationunit)?,
+                ));
+            }
         }
-
         Ok(Self {
             arguments,
             result: Box::new(Type::from_clangtype(
@@ -273,15 +306,21 @@ impl Function {
                 compilationunit,
             )?),
             is_variadic: entity.is_variadic(),
+            overridden_methods: entity
+                .get_overridden_methods()
+                .map(|v| {
+                    v.iter()
+                        .map(|entity| ItemRef::from_entity(&entity).unwrap())
+                        .collect()
+                })
+                .unwrap_or_else(|| Vec::new()),
             outerty: Box::new(Type::from_entity(entity, compilationunit)?),
         })
     }
 }
 
 impl ItemKindFns for Function {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, FunctionKind);
-
+    fn try_update(&mut self, other: &mut Function) -> bool {
         self == other
     }
 
@@ -419,12 +458,10 @@ impl Type {
                             _ => None,
                         },
                         |decl| {
-                            if decl.is_anonymous() {
+                            if false && decl.is_anonymous() {
                                 Some(TypeSegment::Anonymous(
                                     Item::from_entity(&decl, compilationunit).unwrap()?,
                                 ))
-                            } else if entity == Some(&decl) {
-                                None
                             } else {
                                 Some(TypeSegment::ItemRef(ItemRef::from_entity(&decl)?))
                             }
@@ -497,9 +534,9 @@ pub(crate) struct Field {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct Struct {
+pub(crate) struct StructLike {
     pub(crate) fields: Vec<Field>,
-    pub(crate) items: Vec<Item>,
+    pub(crate) items: ItemList,
     pub(crate) outerty: Type,
 }
 
@@ -507,8 +544,14 @@ fn get_fields(
     container_entity: &clang::Entity<'_>,
     compilationunit: &std::sync::Arc<std::path::PathBuf>,
 ) -> Result<Vec<Field>, Error> {
-    let ty = container_entity.get_type().unwrap();
-    let fields = ty.get_fields().unwrap();
+    let ty = match container_entity.get_type() {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
+    let fields = match ty.get_fields() {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
 
     let mut v = Vec::new();
     for entity in &fields {
@@ -522,30 +565,29 @@ fn get_fields(
     Ok(v)
 }
 
-impl Struct {
+impl StructLike {
     fn from_entity(
         entity: &clang::Entity<'_>,
         compilationunit: &std::sync::Arc<std::path::PathBuf>,
     ) -> Result<Self, Error> {
         Ok(Self {
             fields: get_fields(entity, compilationunit)?,
-            items: Vec::new(),
+            items: ItemList::default(),
             outerty: Type::from_entity(entity, compilationunit)?,
         })
     }
 }
 
-impl ItemKindFns for Struct {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, StructKind);
+impl ItemKindFns for StructLike {
+    fn try_update(&mut self, other: &mut StructLike) -> bool {
         self.fields == other.fields
     }
 
-    fn items(&self) -> Option<&[Item]> {
+    fn items(&self) -> Option<&ItemList> {
         Some(&self.items)
     }
 
-    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+    fn items_mut(&mut self) -> Option<&mut ItemList> {
         Some(&mut self.items)
     }
 
@@ -572,48 +614,8 @@ impl Typedef {
 }
 
 impl ItemKindFns for Typedef {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, TypedefKind);
+    fn try_update(&mut self, other: &mut Typedef) -> bool {
         self.outerty == other.outerty
-    }
-
-    fn outertype(&self) -> Option<&Type> {
-        Some(&self.outerty)
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) struct Union {
-    pub(crate) fields: Vec<Field>,
-    pub(crate) items: Vec<Item>,
-    pub(crate) outerty: Box<Type>,
-}
-
-impl Union {
-    fn from_entity(
-        entity: &clang::Entity<'_>,
-        compilationunit: &std::sync::Arc<std::path::PathBuf>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            fields: get_fields(entity, compilationunit)?,
-            items: Vec::new(),
-            outerty: Box::new(Type::from_entity(entity, compilationunit)?),
-        })
-    }
-}
-
-impl ItemKindFns for Union {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, UnionKind);
-        self.fields == other.fields
-    }
-
-    fn items(&self) -> Option<&[Item]> {
-        Some(&self.items)
-    }
-
-    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
-        Some(&mut self.items)
     }
 
     fn outertype(&self) -> Option<&Type> {
@@ -638,8 +640,7 @@ impl Variable {
 }
 
 impl ItemKindFns for Variable {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, VariableKind);
+    fn try_update(&mut self, other: &mut Variable) -> bool {
         self.outerty == other.outerty
     }
 
@@ -650,70 +651,41 @@ impl ItemKindFns for Variable {
 
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Namespace {
-    items: Vec<Item>,
+    items: ItemList,
 }
 
 impl ItemKindFns for Namespace {
-    fn try_update(&mut self, other: &mut ItemKind) -> bool {
-        let other = unwrap_enum!(other, NamespaceKind);
-        for item in other.items.drain(..) {
-            self.items.push(item);
+    fn try_update(&mut self, other: &mut Namespace) -> bool {
+        for item in other.items.inner.drain(..) {
+            self.items.push_deduplicate(item);
         }
         true
     }
 
-    fn items(&self) -> Option<&[Item]> {
+    fn items(&self) -> Option<&ItemList> {
         Some(&self.items)
     }
 
-    fn items_mut(&mut self) -> Option<&mut Vec<Item>> {
+    fn items_mut(&mut self) -> Option<&mut ItemList> {
         Some(&mut self.items)
     }
 }
 
-#[enum_dispatch::enum_dispatch(ItemKindFns)]
-#[derive(Debug, PartialEq)]
-pub(crate) enum ItemKind {
-    EnumKind(Enum),
-    FunctionKind(Function),
-    StructKind(Struct),
-    TypedefKind(Typedef),
-    UnionKind(Union),
-    VariableKind(Variable),
-    NamespaceKind(Namespace),
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ItemList {
+    inner: Vec<Item>,
 }
 
-impl ItemKind {
-    pub(crate) fn eq_outer(&self, other: &Self) -> bool {
-        match self {
-            EnumKind(..) => matches!(other, Self::EnumKind(..)),
-            FunctionKind(..) => matches!(other, Self::FunctionKind(..)),
-            StructKind(..) => matches!(other, Self::StructKind(..)),
-            TypedefKind(..) => matches!(other, Self::TypedefKind(..)),
-            UnionKind(..) => matches!(other, Self::UnionKind(..)),
-            VariableKind(..) => matches!(other, Self::VariableKind(..)),
-            NamespaceKind(..) => matches!(other, Self::NamespaceKind(..)),
-        }
-    }
-
-    pub(crate) fn eq_clangkind(&self, other: &clang::EntityKind) -> bool {
-        match self {
-            EnumKind(..) => matches!(other, clang::EntityKind::EnumDecl),
-            FunctionKind(..) => matches!(other, clang::EntityKind::FunctionDecl),
-            StructKind(..) => matches!(other, clang::EntityKind::StructDecl),
-            TypedefKind(..) => matches!(other, clang::EntityKind::TypedefDecl),
-            UnionKind(..) => matches!(other, clang::EntityKind::UnionDecl),
-            VariableKind(..) => matches!(other, clang::EntityKind::VarDecl),
-            NamespaceKind(..) => matches!(other, clang::EntityKind::Namespace),
-        }
+impl ItemList {
+    pub(crate) fn as_slice(&self) -> &[Item] {
+        &self.inner
     }
 
     /// pushes a new item to the kind if it supports children
     /// if it exists, either merge them or push it as a duplicate.
     /// returns the index of the new item or existing item ignoring duplicates
     fn push_deduplicate(&mut self, mut new_item: Item) -> usize {
-        let items = self.items_mut().unwrap();
-        for (index, item) in items.iter_mut().enumerate() {
+        for (index, item) in self.inner.iter_mut().enumerate() {
             if item.name != new_item.name {
                 continue;
             }
@@ -735,7 +707,7 @@ impl ItemKind {
                 // so overwrite the non definition if we have one now.
                 // we only do this if the itemkind is the same to not loose
                 // duplicates with different kinds.
-                if !item.is_definition {
+                if !item.is_definition && !item.kind.is_nondef_usable() {
                     let comment = item.comment.take();
                     *item = new_item;
 
@@ -747,12 +719,20 @@ impl ItemKind {
                 }
             }
 
+            for duplicate in &mut item.duplicates {
+                if duplicate.kind.eq_outer(&new_item.kind) {
+                    if duplicate.kind.try_update(&mut new_item.kind) {
+                        return index;
+                    }
+                }
+            }
+
             item.duplicates.push(new_item);
             return index;
         }
 
-        items.push(new_item);
-        items.len() - 1
+        self.inner.push(new_item);
+        self.inner.len() - 1
     }
 
     /// push the new item to the given relative path
@@ -762,19 +742,24 @@ impl ItemKind {
         path: &[(String, clang::Entity<'_>)],
     ) -> Result<(), Error> {
         if let Some((name, entity)) = path.first() {
-            if let Some(item) =
-                self.items_mut().unwrap().iter_mut().find(|e| {
-                    e.kind.eq_clangkind(&entity.get_kind()) && e.name.as_ref() == Some(name)
-                })
+            if let Some(item) = self
+                .inner
+                .iter_mut()
+                .find(|e| e.kind.eq_clangkind(&entity.get_kind()) && e.name.as_ref() == Some(name))
             {
-                item.kind.push_to_path(new_item, &path[1..])?;
+                item.kind
+                    .items_mut()
+                    .unwrap()
+                    .push_to_path(new_item, &path[1..])?;
             } else {
                 let index = self.push_deduplicate(
                     Item::from_entity(entity, &new_item.compilationunit)?.unwrap(),
                 );
 
-                self.items_mut().unwrap()[index]
+                self.inner[index]
                     .kind
+                    .items_mut()
+                    .unwrap()
                     .push_to_path(new_item, &path[1..])?;
             }
         } else {
@@ -813,9 +798,125 @@ impl ItemKind {
             }
             path.reverse();
         }
+
         self.push_to_path(new_item, &path)?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ItemKind {
+    EnumKind(Enum),
+    FunctionKind(Function),
+    StructKind(StructLike),
+    TypedefKind(Typedef),
+    UnionKind(StructLike),
+    VariableKind(Variable),
+    NamespaceKind(Namespace),
+    ClassKind(StructLike),
+}
+
+impl ItemKind {
+    pub(crate) fn human_name(&self) -> &str {
+        match self {
+            EnumKind(..) => "Enum ",
+            FunctionKind(..) => "Function ",
+            StructKind(..) => "Struct ",
+            TypedefKind(..) => "Type Definition ",
+            UnionKind(..) => "Union ",
+            VariableKind(..) => "Variable ",
+            NamespaceKind(..) => "Namespace ",
+            ClassKind(..) => "Class ",
+        }
+    }
+
+    /// does a forward declaration of this kind give us all info we need?
+    pub(crate) fn is_nondef_usable(&self) -> bool {
+        match self {
+            EnumKind(..) | StructKind(..) | UnionKind(..) | ClassKind(..) => false,
+            FunctionKind(..) | TypedefKind(..) | VariableKind(..) | NamespaceKind(..) => true,
+        }
+    }
+
+    pub(crate) fn eq_outer(&self, other: &Self) -> bool {
+        match self {
+            EnumKind(..) => matches!(other, Self::EnumKind(..)),
+            FunctionKind(..) => matches!(other, Self::FunctionKind(..)),
+            StructKind(..) => matches!(other, Self::StructKind(..)),
+            TypedefKind(..) => matches!(other, Self::TypedefKind(..)),
+            UnionKind(..) => matches!(other, Self::UnionKind(..)),
+            VariableKind(..) => matches!(other, Self::VariableKind(..)),
+            NamespaceKind(..) => matches!(other, Self::NamespaceKind(..)),
+            ClassKind(..) => matches!(other, Self::ClassKind(..)),
+        }
+    }
+
+    pub(crate) fn eq_clangkind(&self, other: &clang::EntityKind) -> bool {
+        match self {
+            EnumKind(..) => matches!(other, clang::EntityKind::EnumDecl),
+            FunctionKind(..) => {
+                matches!(other, clang::EntityKind::FunctionDecl)
+                    || matches!(other, clang::EntityKind::Method)
+                    || matches!(other, clang::EntityKind::Constructor)
+                    || matches!(other, clang::EntityKind::Destructor)
+                    || matches!(other, clang::EntityKind::ConversionFunction)
+                    || matches!(other, clang::EntityKind::FunctionTemplate)
+            }
+            StructKind(..) => matches!(other, clang::EntityKind::StructDecl),
+            TypedefKind(..) => matches!(other, clang::EntityKind::TypedefDecl),
+            UnionKind(..) => matches!(other, clang::EntityKind::UnionDecl),
+            VariableKind(..) => matches!(other, clang::EntityKind::VarDecl),
+            NamespaceKind(..) => matches!(other, clang::EntityKind::Namespace),
+            ClassKind(..) => {
+                matches!(other, clang::EntityKind::ClassDecl)
+                    || matches!(other, clang::EntityKind::ClassTemplate)
+            }
+        }
+    }
+}
+
+impl ItemKindFns for ItemKind {
+    /// if the other itemkind is similar enough, extend this item with it's data and return true
+    /// Otherwise, return false
+    fn try_update(&mut self, other: &mut ItemKind) -> bool {
+        match self {
+            EnumKind(k) => k.try_update(unwrap_enum!(other, EnumKind)),
+            FunctionKind(k) => k.try_update(unwrap_enum!(other, FunctionKind)),
+            StructKind(k) => k.try_update(unwrap_enum!(other, StructKind)),
+            UnionKind(k) => k.try_update(unwrap_enum!(other, UnionKind)),
+            ClassKind(k) => k.try_update(unwrap_enum!(other, ClassKind)),
+            TypedefKind(k) => k.try_update(unwrap_enum!(other, TypedefKind)),
+            VariableKind(k) => k.try_update(unwrap_enum!(other, VariableKind)),
+            NamespaceKind(k) => k.try_update(unwrap_enum!(other, NamespaceKind)),
+        }
+    }
+
+    fn items(&self) -> Option<&ItemList> {
+        match self {
+            StructKind(k) | UnionKind(k) | ClassKind(k) => k.items(),
+            NamespaceKind(k) => k.items(),
+            _ => None,
+        }
+    }
+
+    fn items_mut(&mut self) -> Option<&mut ItemList> {
+        match self {
+            StructKind(k) | UnionKind(k) | ClassKind(k) => k.items_mut(),
+            NamespaceKind(k) => k.items_mut(),
+            _ => None,
+        }
+    }
+
+    fn outertype(&self) -> Option<&Type> {
+        match self {
+            EnumKind(k) => k.outertype(),
+            FunctionKind(k) => k.outertype(),
+            StructKind(k) | UnionKind(k) | ClassKind(k) => k.outertype(),
+            TypedefKind(k) => k.outertype(),
+            VariableKind(k) => k.outertype(),
+            NamespaceKind(k) => k.outertype(),
+        }
     }
 }
 
@@ -861,9 +962,12 @@ impl Item {
         };
 
         let abspath = std::fs::canonicalize(loc.0)?;
-        if abspath.extension() != Some(std::ffi::OsStr::new("h")) {
-            // TODO: maybe we want to remove this to extract documentation from source files
-            return Ok(None);
+        match abspath.extension().map_or(None, |s| s.to_str()) {
+            Some("h") | Some("hpp") => (),
+            _ => {
+                // TODO: maybe we want to remove this to extract documentation from source files
+                return Ok(None);
+            }
         }
 
         // wait for the definition
@@ -874,21 +978,36 @@ impl Item {
 
         let kind = match entity.get_kind() {
             clang::EntityKind::EnumDecl => EnumKind(Enum::from_entity(entity, compilationunit)?),
-            clang::EntityKind::FunctionDecl => {
+            clang::EntityKind::FunctionDecl
+            | clang::EntityKind::Method
+            | clang::EntityKind::Constructor
+            | clang::EntityKind::Destructor
+            | clang::EntityKind::FunctionTemplate
+            | clang::EntityKind::ConversionFunction => {
                 FunctionKind(Function::from_entity(entity, compilationunit)?)
             }
             clang::EntityKind::StructDecl => {
-                StructKind(Struct::from_entity(entity, compilationunit)?)
+                StructKind(StructLike::from_entity(entity, compilationunit)?)
             }
             clang::EntityKind::TypedefDecl => {
                 TypedefKind(Typedef::from_entity(entity, compilationunit)?)
             }
-            clang::EntityKind::UnionDecl => UnionKind(Union::from_entity(entity, compilationunit)?),
+            clang::EntityKind::UnionDecl => {
+                UnionKind(StructLike::from_entity(entity, compilationunit)?)
+            }
             clang::EntityKind::VarDecl => {
                 VariableKind(Variable::from_entity(entity, compilationunit)?)
             }
             clang::EntityKind::Namespace => NamespaceKind(Namespace::default()),
-            _ => return Ok(None),
+            clang::EntityKind::ClassTemplate
+            | clang::EntityKind::ClassDecl
+            | clang::EntityKind::ClassTemplatePartialSpecialization => {
+                ClassKind(StructLike::from_entity(entity, compilationunit)?)
+            }
+            other => {
+                //eprintln!("{:?}", other);
+                return Ok(None);
+            }
         };
 
         Ok(Some(Item {
@@ -907,7 +1026,7 @@ impl Item {
     }
 
     pub(crate) fn items(&self) -> Option<&[Item]> {
-        self.kind.items()
+        Some(&self.kind.items()?.inner)
     }
 
     pub(crate) fn outertype(&self) -> Option<&Type> {
@@ -915,8 +1034,10 @@ impl Item {
     }
 
     pub(crate) fn extend(&mut self, mut other: Item) {
-        for item in other.kind.items_mut().unwrap().drain(..) {
-            self.kind.push_deduplicate(item);
+        let dst = self.kind.items_mut().unwrap();
+
+        for item in other.kind.items_mut().unwrap().inner.drain(..) {
+            dst.push_deduplicate(item);
         }
     }
 

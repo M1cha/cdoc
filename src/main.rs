@@ -2,6 +2,9 @@
 //       ignore the non-inline one.
 // TODO: function forward declarations might have additional attributes, merge
 // TODO: consider TypeRefs
+// TODO: prevent merging class methods. maybe they should store their methods directly
+//       functions should be ok to merge. This will prevent overloaded methods from
+//       ending up as duplicates.
 
 mod escape;
 mod format;
@@ -61,27 +64,38 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
         .tempfile()?;
 
     // TODO: use argument parser which supports quoting
-    let mut args: Vec<_> = command.command.split_whitespace().collect();
-
-    // disable object creation
-    args.retain(|&arg| arg != "-c");
+    let args_orig: Vec<_> = command.command.split_whitespace().collect();
 
     // remove output files
-    while let Ok(index) = args.binary_search(&"-o") {
-        args.remove(index);
-        args.remove(index);
+    let mut args = Vec::with_capacity(args_orig.len());
+    let mut iter = args_orig.iter();
+    while let Some(arg) = iter.next() {
+        if arg == &"-o" {
+            iter.next().unwrap();
+            continue;
+        }
+        if arg.starts_with("-o") {
+            continue;
+        }
+        if arg == &"-c" {
+            continue;
+        }
+
+        args.push(arg.to_string());
     }
 
     // preprocessor only
-    args.push("-E");
+    args.push("-E".to_string());
     // retain comments
-    args.push("-C");
+    args.push("-C".to_string());
 
-    args.push("-o");
-    args.push(outfile.path().to_str().unwrap());
+    args.push("-o".to_string());
+    args.push(outfile.path().to_str().unwrap().to_string());
+
+    println!("{}", args.join(" "));
 
     //println!("ARGS: {:?}", args);
-    let status = std::process::Command::new(args[0])
+    let status = std::process::Command::new(&args[0])
         .args(&args[1..])
         .status()?;
     if !status.success() {
@@ -94,15 +108,15 @@ fn process_file(command: &CompileCommand, clang: &clang::Clang) -> Result<parsed
         .skip_function_bodies(true)
         .arguments(&[
             // TODO: detect target
-            "-target",
-            "armv7a",
+            //"-target",
+            //"armv7a",
+            "-fretain-comments-from-system-headers",
             // disable static assertions because they might fail
             "-D_Static_assert(...)=",
             // remove all clang functions and include directories
             "-fno-builtin",
             "-nostdinc",
             "-ffreestanding",
-            //"-xc++",
         ])
         .parse()
         .unwrap();
@@ -344,8 +358,9 @@ fn write_itemkind_fields<W: std::fmt::Write, N: std::fmt::Display>(
     itemkind: &parsed::ItemKind,
 ) -> std::fmt::Result {
     match &itemkind {
-        parsed::StructKind(parsed::Struct { fields, .. })
-        | parsed::UnionKind(parsed::Union { fields, .. }) => {
+        parsed::StructKind(parsed::StructLike { fields, .. })
+        | parsed::UnionKind(parsed::StructLike { fields, .. })
+        | parsed::ClassKind(parsed::StructLike { fields, .. }) => {
             if !fields.is_empty() {
                 write!(
                     f,
@@ -511,11 +526,64 @@ fn write_fields_with_header<W: std::fmt::Write>(
     Ok(())
 }
 
-fn write_struct_or_union<W: std::fmt::Write>(
+fn write_small_section_header<W: std::fmt::Write>(
+    f: &mut W,
+    id: &str,
+    title: &str,
+    extra_content: &str,
+) -> std::fmt::Result {
+    write!(
+        f,
+        "<h2 id=\"{0}\" class=\"small-section-header\">\
+                {1}<a href=\"#{0}\" class=\"anchor\"></a>\
+             </h2>{2}",
+        id, title, extra_content
+    )
+}
+
+fn write_loading_content<W: std::fmt::Write>(f: &mut W, extra_content: &str) -> std::fmt::Result {
+    write!(
+        f,
+        "{}<span class=\"loading-content\">Loading content...</span>",
+        extra_content
+    )
+}
+
+fn write_methods<W: std::fmt::Write>(
+    cx: &Context,
+    f: &mut W,
+    methods: &[(&parsed::Item, &parsed::Function)],
+    id: &str,
+    title: &str,
+) -> std::fmt::Result {
+    if methods.is_empty() {
+        return Ok(());
+    }
+
+    write_small_section_header(f, id, title, "<div class=\"methods\">")?;
+    for (fn_entity, func) in methods {
+        let item_type = fn_entity.type_();
+        let id = format!("{}.{}", item_type, fn_entity.name.as_ref().unwrap());
+        write!(
+            f,
+            "<h3 id=\"{id}\" class=\"method\"><code>{code}",
+            id = id,
+            code = HtmlTypeFormatter::new(cx, fn_entity.outertype().unwrap())
+        )?;
+        write!(f, "</code>")?;
+        write!(f, "</h3>")?;
+        write_documentation(f, fn_entity.comment.as_ref())?;
+    }
+    write_loading_content(f, "</div>")?;
+
+    Ok(())
+}
+
+fn write_structlike<W: std::fmt::Write>(
     cx: &Context,
     f: &mut W,
     item: &parsed::Item,
-    fields: &[parsed::Field],
+    s: &parsed::StructLike,
 ) -> std::fmt::Result {
     wrap_into_docblock(f, |f| {
         write!(
@@ -527,9 +595,31 @@ fn write_struct_or_union<W: std::fmt::Write>(
     })?;
     write_documentation(f, item.comment.as_ref())?;
 
-    if !fields.is_empty() {
-        write_fields_with_header(cx, f, fields)?;
+    if !s.fields.is_empty() {
+        write_fields_with_header(cx, f, &s.fields)?;
     }
+
+    let mut fns_provided = Vec::new();
+    let mut fns_overriding = Vec::new();
+    for fn_entity in s.items.as_slice() {
+        if let parsed::FunctionKind(func) = &fn_entity.kind {
+            let topush = (fn_entity, func);
+            if func.overridden_methods.is_empty() {
+                fns_provided.push(topush);
+            } else {
+                fns_overriding.push(topush);
+            }
+        }
+    }
+
+    write_methods(cx, f, &fns_provided, "provided-methods", "Provided Methods")?;
+    write_methods(
+        cx,
+        f,
+        &fns_overriding,
+        "overriding-methods",
+        "Overriding Methods",
+    )?;
 
     Ok(())
 }
@@ -792,15 +882,7 @@ fn write_page_content<W: std::fmt::Write>(
     write!(f, "</span>")?; // out-of-band
     write!(f, "<span class=\"in-band\">")?;
 
-    let name = match item.kind {
-        parsed::EnumKind(..) => "Enum ",
-        parsed::FunctionKind(..) => "Function ",
-        parsed::StructKind(..) => "Struct ",
-        parsed::TypedefKind(..) => "Type Definition ",
-        parsed::UnionKind(..) => "Union ",
-        parsed::VariableKind(..) => "Variable ",
-        parsed::NamespaceKind(..) => "Namespace ",
-    };
+    let name = item.kind.human_name();
     f.write_str(name)?;
 
     write!(
@@ -818,14 +900,49 @@ fn write_page_content<W: std::fmt::Write>(
         match &item.kind {
             parsed::EnumKind(func) => write_enum(cx, f, item, func)?,
             parsed::FunctionKind(func) => write_function(cx, f, item, func)?,
-            parsed::StructKind(parsed::Struct { fields, .. })
-            | parsed::UnionKind(parsed::Union { fields, .. }) => {
-                write_struct_or_union(cx, f, item, &fields)?
+            parsed::StructKind(s) | parsed::UnionKind(s) | parsed::ClassKind(s) => {
+                write_structlike(cx, f, item, s)?
             }
             parsed::TypedefKind(typedef) => write_typedef(cx, f, item, typedef)?,
             parsed::VariableKind(variable) => write_variable(cx, f, item, variable)?,
             parsed::NamespaceKind(_) => write_index(cx, f, item)?,
         }
+    }
+
+    if !item.duplicates.is_empty() {
+        write!(
+            f,
+            "<h2 id=\"duplicates\" class=\"small-section-header\">\
+                     Duplicate Declarations<a href=\"#duplicates\" class=\"anchor\"></a>\
+                 </h2>\
+                 <table>",
+        )?;
+
+        for (index, duplicate) in item.duplicates.iter().enumerate() {
+            write!(
+                f,
+                "<tr class=\"module-item\">\
+                     <td>{humanty}<a class=\"{ty}\" href=\"{ty}.{name}.{id}.html\">{name}</a></td>\
+                     <td>{row2}</td>\
+                 </tr>",
+                humanty = duplicate.kind.human_name(),
+                ty = duplicate.type_(),
+                name = duplicate.name.as_ref().unwrap(),
+                id = index,
+                row2 = format::display_fn(|f| {
+                    if let parsed::FunctionKind(func) = &duplicate.kind {
+                        write!(
+                            f,
+                            "<code>{}</code>",
+                            HtmlTypeFormatter::new(cx, &func.outerty)
+                        )?;
+                    }
+                    Ok(())
+                }),
+            )?;
+        }
+
+        write!(f, "</table>")?;
     }
 
     Ok(())
@@ -877,13 +994,27 @@ fn write_sidebar<W: std::fmt::Write>(
     Ok(())
 }
 
-fn write_item(cx: &Context, item: &parsed::Item, index: bool) -> Result<(), Error> {
+fn write_item(
+    cx: &Context,
+    item: &parsed::Item,
+    index: bool,
+    dupid: Option<usize>,
+) -> Result<(), Error> {
     let ty = item.type_();
     let path = if index {
         cx.dst.join("index.html")
     } else {
-        cx.dst
-            .join(format!("{}.{}.html", ty, item.name.as_ref().unwrap()))
+        cx.dst.join(format!(
+            "{}.{}{}.html",
+            ty,
+            item.name.as_ref().unwrap(),
+            format::display_fn(|f| {
+                if let Some(dupid) = dupid {
+                    write!(f, ".{}", dupid)?;
+                };
+                Ok(())
+            }),
+        ))
     };
     let f = open_file(path)?;
 
@@ -925,11 +1056,15 @@ fn write_item(cx: &Context, item: &parsed::Item, index: bool) -> Result<(), Erro
 fn write_items(cx: &mut Context, container: &parsed::Item) -> Result<(), Error> {
     let items = container.items().unwrap();
 
-    write_item(&cx, container, true)?;
+    write_item(&cx, container, true, None)?;
 
     for item in items {
         if !matches!(item.kind, parsed::ItemKind::NamespaceKind(..)) {
-            write_item(&cx, item, false)?;
+            write_item(&cx, item, false, None)?;
+
+            for (index, duplicate) in item.duplicates.iter().enumerate() {
+                write_item(&cx, duplicate, false, Some(index))?;
+            }
         }
 
         if item.items().map(|items| !items.is_empty()).unwrap_or(false) {
@@ -986,11 +1121,14 @@ fn main() -> Result<(), Error> {
 
     let cwd = std::env::current_dir()?;
     let mut results: Vec<_> = cdb
-        .par_iter()
+        .iter()
+        .take(2)
         .filter_map(|command| {
             // skip unsupported files
             match command.file.extension().map(|o| o.to_str()).unwrap_or(None) {
-                Some("c") | Some("h") => Some(process_file(command, &clang).unwrap()),
+                Some("c") | Some("cpp") | Some("h") | Some("cc") | Some("hpp") => {
+                    Some(process_file(command, &clang).unwrap())
+                }
                 _ => None,
             }
         })

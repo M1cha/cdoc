@@ -133,6 +133,7 @@ pre {
 .content .highlighted.static { background-color: #c3e0ff; }
 .content .highlighted.primitive { background-color: #9aecff; }
 .content .highlighted.keyword { background-color: #f99650; }
+.content .highlighted.class { background-color: #e7b1a0; }
 
 .content .item-info::before { color: #ccc; }
 
@@ -156,6 +157,7 @@ pre {
 .content span.tymethod, .content a.tymethod, .block a.current.tymethod,
 .content .fnname { color: #9a6e31; }
 .content span.keyword, .content a.keyword, .block a.current.keyword { color: #de5249; }
+.content span.class, .content a.class, .block a.current.class { color: #ad448e; }
 
 pre.rust .comment { color: #8E908C; }
 pre.rust .doccomment { color: #4D4D4C; }
